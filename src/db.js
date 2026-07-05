@@ -173,6 +173,36 @@ export function gameStats(gameId, days = 30) {
     )
     .all(gameId);
 
+  // Progression funnel: unique players who started each level/wave, read from
+  // the JSON props of level_start / wave_start events (a convention, not a
+  // requirement — games that don't send them get empty arrays and the
+  // dashboard hides the section). Events without a numeric level are skipped
+  // (e.g. editor playtests send level: null).
+  const levelFunnel = db
+    .prepare(
+      `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
+              MAX(json_extract(props, '$.name')) AS name,
+              COUNT(DISTINCT player_id) AS players
+       FROM events
+       WHERE game_id = ? AND created_at >= ? AND name = 'level_start'
+         AND json_extract(props, '$.level') IS NOT NULL
+       GROUP BY level ORDER BY level`
+    )
+    .all(gameId, since);
+
+  const waveFunnel = db
+    .prepare(
+      `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
+              CAST(json_extract(props, '$.wave') AS INTEGER) AS wave,
+              COUNT(DISTINCT player_id) AS players
+       FROM events
+       WHERE game_id = ? AND created_at >= ? AND name = 'wave_start'
+         AND json_extract(props, '$.level') IS NOT NULL
+         AND json_extract(props, '$.wave') IS NOT NULL
+       GROUP BY level, wave ORDER BY level, wave`
+    )
+    .all(gameId, since);
+
   return {
     totals: { ...totals, events: eventCount, median_playtime_s: medianPlaytime },
     daily,
@@ -180,6 +210,7 @@ export function gameStats(gameId, days = 30) {
     os: breakdown("os"),
     referrers: breakdown("referrer"),
     top_events: topEvents,
+    progression: { levels: levelFunnel, waves: waveFunnel },
     recent_sessions: recentSessions,
   };
 }

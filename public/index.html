@@ -128,6 +128,18 @@
     <div id="lineChart"></div>
   </div>
 
+  <!-- Shown only when the game sends level_start / wave_start events with
+       {level, wave} props (see the funnel queries in src/db.js). -->
+  <div class="grid-2" id="progression" hidden>
+    <div class="card"><h2>Levels reached · unique players</h2><div id="levelsChart"></div></div>
+    <div class="card">
+      <h2 style="display:flex;align-items:center;gap:8px">Waves reached in
+        <select id="waveLevelSel" style="padding:3px 8px"></select>
+      </h2>
+      <div id="wavesChart"></div>
+    </div>
+  </div>
+
   <div class="grid-2">
     <div class="card"><h2>Top events</h2><div id="eventsChart"></div></div>
     <div class="card"><h2>Browsers</h2><div id="browsersChart"></div></div>
@@ -300,6 +312,32 @@ function renderBars(el, items, total) {
   });
 }
 
+// ---- progression funnel: levels & waves reached ----
+let waveLevel = null, lastProgression = null, lastTotalPlayers = null;
+function renderProgression(p, totalPlayers) {
+  lastProgression = p;
+  lastTotalPlayers = totalPlayers;
+  const hasData = p && (p.levels.length || p.waves.length);
+  $("#progression").hidden = !hasData;
+  if (!hasData) return;
+  renderBars($("#levelsChart"), p.levels.map(l => ({
+    label: `Level ${l.level}${l.name ? " · " + l.name : ""}`, n: l.players,
+  })), totalPlayers);
+  const levels = [...new Set(p.waves.map(w => w.level))];
+  if (!levels.includes(waveLevel)) waveLevel = levels[0];
+  $("#waveLevelSel").innerHTML = levels.map(l =>
+    `<option value="${l}" ${l === waveLevel ? "selected" : ""}>Level ${l}</option>`).join("");
+  // % in the tooltip is relative to the players who STARTED this level
+  const started = p.levels.find(l => l.level === waveLevel)?.players || null;
+  renderBars($("#wavesChart"),
+    p.waves.filter(w => w.level === waveLevel).map(w => ({ label: `Wave ${w.wave}`, n: w.players })),
+    started);
+}
+$("#waveLevelSel").addEventListener("change", (e) => {
+  waveLevel = +e.target.value;
+  renderProgression(lastProgression, lastTotalPlayers);
+});
+
 // ---- data loading ----
 async function loadStats() {
   if (!gameId) return;
@@ -309,6 +347,7 @@ async function loadStats() {
   $("#tPlaytime").textContent = fmtDur(s.totals.median_playtime_s);
   $("#tEvents").textContent = fmtN(s.totals.events);
   renderLine($("#lineChart"), s.daily);
+  renderProgression(s.progression, s.totals.players);
   renderBars($("#eventsChart"), s.top_events, null);
   renderBars($("#browsersChart"), s.browsers, s.totals.sessions);
   renderBars($("#referrersChart"), s.referrers, s.totals.sessions);
