@@ -156,6 +156,8 @@ export async function gameStats(gameId, days = 30) {
     levelFunnel,
     waveFunnel,
     builds,
+    upgrades,
+    economy,
     recentSessions,
   ] = await Promise.all([
     get(
@@ -231,6 +233,28 @@ export async function gameStats(gameId, days = 30) {
        GROUP BY label ORDER BY n DESC LIMIT 12`,
       [gameId, since]
     ),
+    // Upgrade popularity: purchases per tech node, from 'upgrade' events.
+    all(
+      `SELECT COALESCE(json_extract(props, '$.id'), 'unknown') AS label,
+              COUNT(*) AS n,
+              COUNT(DISTINCT player_id) AS players
+       FROM events
+       WHERE game_id = ? AND created_at >= ? AND name = 'upgrade'
+       GROUP BY label ORDER BY n DESC LIMIT 15`,
+      [gameId, since]
+    ),
+    // Economy curve: average currency held at fixed playtime marks, from
+    // 'currency_milestone' events ({min, crystals, ...}).
+    all(
+      `SELECT CAST(json_extract(props, '$.min') AS INTEGER) AS min,
+              ROUND(AVG(json_extract(props, '$.crystals'))) AS avg_crystals,
+              COUNT(DISTINCT player_id) AS players
+       FROM events
+       WHERE game_id = ? AND created_at >= ? AND name = 'currency_milestone'
+         AND json_extract(props, '$.min') IS NOT NULL
+       GROUP BY min ORDER BY min`,
+      [gameId, since]
+    ),
     all(
       `SELECT player_id, started_at, (last_seen - started_at) AS duration_s,
               referrer, browser, os
@@ -249,6 +273,8 @@ export async function gameStats(gameId, days = 30) {
     top_events: topEvents,
     progression: { levels: levelFunnel, waves: waveFunnel },
     builds,
+    upgrades,
+    economy,
     recent_sessions: recentSessions,
   };
 }

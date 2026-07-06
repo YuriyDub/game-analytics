@@ -145,6 +145,14 @@
     <div class="card" id="buildsCard" hidden>
       <h2>Turrets &amp; obstacles built</h2><div id="buildsChart"></div>
     </div>
+    <!-- Shown only when the game sends 'upgrade' events with an {id} prop. -->
+    <div class="card" id="upgradesCard" hidden>
+      <h2>Upgrades bought</h2><div id="upgradesChart"></div>
+    </div>
+    <!-- Shown only when the game sends 'currency_milestone' events ({min, crystals}). -->
+    <div class="card" id="economyCard" hidden>
+      <h2>Avg crystals held at playtime marks</h2><div id="economyChart"></div>
+    </div>
     <div class="card"><h2>Top events</h2><div id="eventsChart"></div></div>
     <div class="card"><h2>Browsers</h2><div id="browsersChart"></div></div>
     <div class="card"><h2>Referrers</h2><div id="referrersChart"></div></div>
@@ -360,6 +368,16 @@ async function loadStats() {
     label: b.label, n: b.n,
     sub: `by ${fmtN(b.players)} player${b.players === 1 ? "" : "s"}`,
   })), s.builds.reduce((a, b) => a + b.n, 0));
+  $("#upgradesCard").hidden = !s.upgrades.length;
+  renderBars($("#upgradesChart"), s.upgrades.map(u => ({
+    label: u.label, n: u.n,
+    sub: `by ${fmtN(u.players)} player${u.players === 1 ? "" : "s"}`,
+  })), s.upgrades.reduce((a, u) => a + u.n, 0));
+  $("#economyCard").hidden = !s.economy.length;
+  renderBars($("#economyChart"), s.economy.map(m => ({
+    label: `${m.min} min`, n: m.avg_crystals,
+    sub: `avg over ${fmtN(m.players)} player${m.players === 1 ? "" : "s"}`,
+  })), null);
   renderBars($("#eventsChart"), s.top_events, null);
   renderBars($("#browsersChart"), s.browsers, s.totals.sessions);
   renderBars($("#referrersChart"), s.referrers, s.totals.sessions);
