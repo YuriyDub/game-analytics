@@ -141,6 +141,10 @@
   </div>
 
   <div class="grid-2">
+    <!-- Shown only when the game sends 'build' events with a {type} prop. -->
+    <div class="card" id="buildsCard" hidden>
+      <h2>Turrets &amp; obstacles built</h2><div id="buildsChart"></div>
+    </div>
     <div class="card"><h2>Top events</h2><div id="eventsChart"></div></div>
     <div class="card"><h2>Browsers</h2><div id="browsersChart"></div></div>
     <div class="card"><h2>Referrers</h2><div id="referrersChart"></div></div>
@@ -306,7 +310,10 @@ function renderBars(el, items, total) {
     gr.addEventListener("mousemove", (e) => {
       const it = items[+gr.dataset.i];
       const pct = total ? Math.round(it.n / total * 100) : null;
-      showTooltip(`<div class="row">${esc(it.label)} <b>${it.n.toLocaleString()}${pct !== null ? " · " + pct + "%" : ""}</b></div>`, e.clientX, e.clientY);
+      showTooltip(
+        `<div class="row">${esc(it.label)} <b>${it.n.toLocaleString()}${pct !== null ? " · " + pct + "%" : ""}</b></div>` +
+        (it.sub ? `<div class="row" style="color:var(--ink-2)">${esc(it.sub)}</div>` : ""),
+        e.clientX, e.clientY);
     });
     gr.addEventListener("mouseleave", hideTooltip);
   });
@@ -348,6 +355,11 @@ async function loadStats() {
   $("#tEvents").textContent = fmtN(s.totals.events);
   renderLine($("#lineChart"), s.daily);
   renderProgression(s.progression, s.totals.players);
+  $("#buildsCard").hidden = !s.builds.length;
+  renderBars($("#buildsChart"), s.builds.map(b => ({
+    label: b.label, n: b.n,
+    sub: `by ${fmtN(b.players)} player${b.players === 1 ? "" : "s"}`,
+  })), s.builds.reduce((a, b) => a + b.n, 0));
   renderBars($("#eventsChart"), s.top_events, null);
   renderBars($("#browsersChart"), s.browsers, s.totals.sessions);
   renderBars($("#referrersChart"), s.referrers, s.totals.sessions);

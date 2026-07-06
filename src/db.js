@@ -1,197 +1,215 @@
-import Database from "better-sqlite3";
+import { createClient } from "@libsql/client";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-const DATA_DIR = process.env.DATA_DIR || "./data";
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN) points at a hosted Turso database —
+// use that on hosts with ephemeral disks (e.g. Render's free tier), where a
+// local SQLite file is wiped on every restart. Unset, it falls back to a local
+// file so dev needs no account and no env vars.
+let url = process.env.TURSO_DATABASE_URL;
+if (!url) {
+  const DATA_DIR = process.env.DATA_DIR || "./data";
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  url = "file:" + path.join(DATA_DIR, "analytics.db");
+}
 
-export const db = new Database(path.join(DATA_DIR, "analytics.db"));
-db.pragma("journal_mode = WAL");
-db.pragma("synchronous = NORMAL");
+export const db = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS games (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
+// Normalize driver rows to plain objects keyed by column name — the client's
+// Row shape isn't guaranteed to JSON.stringify cleanly across versions.
+async function all(sql, args = []) {
+  const rs = await db.execute({ sql, args });
+  return rs.rows.map((r) => Object.fromEntries(rs.columns.map((c, i) => [c, r[i]])));
+}
+const get = async (sql, args = []) => (await all(sql, args))[0];
 
-  CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,
-    game_id     TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-    player_id   TEXT NOT NULL,
-    started_at  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL,
-    referrer    TEXT,
-    browser     TEXT,
-    os          TEXT,
-    screen      TEXT,
-    lang        TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_sessions_game_time ON sessions(game_id, started_at);
-
-  CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    game_id    TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL,
-    player_id  TEXT NOT NULL,
-    name       TEXT NOT NULL,
-    props      TEXT,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_events_game_time ON events(game_id, created_at);
-  CREATE INDEX IF NOT EXISTS idx_events_game_name ON events(game_id, name);
-`);
+await db.batch(
+  [
+    `CREATE TABLE IF NOT EXISTS games (
+       id         TEXT PRIMARY KEY,
+       name       TEXT NOT NULL,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE TABLE IF NOT EXISTS sessions (
+       id          TEXT PRIMARY KEY,
+       game_id     TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+       player_id   TEXT NOT NULL,
+       started_at  INTEGER NOT NULL,
+       last_seen   INTEGER NOT NULL,
+       referrer    TEXT,
+       browser     TEXT,
+       os          TEXT,
+       screen      TEXT,
+       lang        TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_game_time ON sessions(game_id, started_at)`,
+    `CREATE TABLE IF NOT EXISTS events (
+       id         INTEGER PRIMARY KEY AUTOINCREMENT,
+       game_id    TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+       session_id TEXT NOT NULL,
+       player_id  TEXT NOT NULL,
+       name       TEXT NOT NULL,
+       props      TEXT,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_events_game_time ON events(game_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_events_game_name ON events(game_id, name)`,
+  ],
+  "write"
+);
 
 const now = () => Math.floor(Date.now() / 1000);
 
-export function createGame(name) {
-  const id = randomBytes(6).toString("base64url");
-  db.prepare("INSERT INTO games (id, name, created_at) VALUES (?, ?, ?)").run(id, name, now());
+// id is optional so a game can be re-created with a known id (e.g. after
+// moving databases) — shipped clients keep reporting without a rebuild.
+export async function createGame(name, id) {
+  id = id || randomBytes(6).toString("base64url");
+  await db.execute({
+    sql: "INSERT INTO games (id, name, created_at) VALUES (?, ?, ?)",
+    args: [id, name, now()],
+  });
   return getGame(id);
 }
 
 export function getGame(id) {
-  return db.prepare("SELECT * FROM games WHERE id = ?").get(id);
+  return get("SELECT * FROM games WHERE id = ?", [id]);
 }
 
 export function listGames() {
-  return db
-    .prepare(
-      `SELECT g.*,
-              (SELECT COUNT(*) FROM sessions s WHERE s.game_id = g.id) AS sessions,
-              (SELECT COUNT(DISTINCT player_id) FROM sessions s WHERE s.game_id = g.id) AS players
-       FROM games g ORDER BY g.created_at DESC`
-    )
-    .all();
+  return all(
+    `SELECT g.*,
+            (SELECT COUNT(*) FROM sessions s WHERE s.game_id = g.id) AS sessions,
+            (SELECT COUNT(DISTINCT player_id) FROM sessions s WHERE s.game_id = g.id) AS players
+     FROM games g ORDER BY g.created_at DESC`
+  );
 }
 
-export function deleteGame(id) {
-  db.prepare("DELETE FROM games WHERE id = ?").run(id);
+// Explicit deletes: SQLite only honours ON DELETE CASCADE with the
+// foreign_keys pragma on, which isn't guaranteed on every connection.
+export async function deleteGame(id) {
+  await db.batch(
+    [
+      { sql: "DELETE FROM events WHERE game_id = ?", args: [id] },
+      { sql: "DELETE FROM sessions WHERE game_id = ?", args: [id] },
+      { sql: "DELETE FROM games WHERE id = ?", args: [id] },
+    ],
+    "write"
+  );
 }
 
-const upsertSession = db.prepare(`
-  INSERT INTO sessions (id, game_id, player_id, started_at, last_seen, referrer, browser, os, screen, lang)
-  VALUES (@id, @game_id, @player_id, @now, @now, @referrer, @browser, @os, @screen, @lang)
-  ON CONFLICT(id) DO UPDATE SET last_seen = @now
-  WHERE sessions.game_id = @game_id
-`);
-
-const insertEvent = db.prepare(`
-  INSERT INTO events (game_id, session_id, player_id, name, props, created_at)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-
-export const recordBatch = db.transaction((gameId, sessionId, playerId, meta, events) => {
-  upsertSession.run({
-    id: sessionId,
-    game_id: gameId,
-    player_id: playerId,
-    now: now(),
-    referrer: meta.referrer || null,
-    browser: meta.browser || null,
-    os: meta.os || null,
-    screen: meta.screen || null,
-    lang: meta.lang || null,
-  });
+export async function recordBatch(gameId, sessionId, playerId, meta, events) {
+  const t = now();
+  const stmts = [
+    {
+      sql: `INSERT INTO sessions (id, game_id, player_id, started_at, last_seen, referrer, browser, os, screen, lang)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
+            WHERE sessions.game_id = excluded.game_id`,
+      args: [
+        sessionId,
+        gameId,
+        playerId,
+        t,
+        t,
+        meta.referrer || null,
+        meta.browser || null,
+        meta.os || null,
+        meta.screen || null,
+        meta.lang || null,
+      ],
+    },
+  ];
   for (const ev of events) {
     if (ev.name === "heartbeat") continue; // heartbeats only refresh last_seen
-    insertEvent.run(
-      gameId,
-      sessionId,
-      playerId,
-      ev.name,
-      ev.props ? JSON.stringify(ev.props) : null,
-      now()
-    );
+    stmts.push({
+      sql: `INSERT INTO events (game_id, session_id, player_id, name, props, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [gameId, sessionId, playerId, ev.name, ev.props ? JSON.stringify(ev.props) : null, t],
+    });
   }
-});
+  await db.batch(stmts, "write");
+}
 
-export function gameStats(gameId, days = 30) {
+export async function gameStats(gameId, days = 30) {
   const since = now() - days * 86400;
 
-  const totals = db
-    .prepare(
+  const breakdown = (col) =>
+    all(
+      `SELECT COALESCE(${col}, 'Unknown') AS label, COUNT(*) AS n
+       FROM sessions WHERE game_id = ? AND started_at >= ?
+       GROUP BY label ORDER BY n DESC LIMIT 8`,
+      [gameId, since]
+    );
+
+  // Independent queries — run in parallel; against a remote Turso database
+  // each one is a network round-trip.
+  const [
+    totals,
+    eventCount,
+    medianRow,
+    daily,
+    browsers,
+    os,
+    referrers,
+    topEvents,
+    levelFunnel,
+    waveFunnel,
+    builds,
+    recentSessions,
+  ] = await Promise.all([
+    get(
       `SELECT COUNT(*) AS sessions,
               COUNT(DISTINCT player_id) AS players,
               COALESCE(SUM(last_seen - started_at), 0) AS playtime_s
-       FROM sessions WHERE game_id = ? AND started_at >= ?`
-    )
-    .get(gameId, since);
-
-  const eventCount = db
-    .prepare(
+       FROM sessions WHERE game_id = ? AND started_at >= ?`,
+      [gameId, since]
+    ),
+    get(
       `SELECT COUNT(*) AS n FROM events
-       WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')`
-    )
-    .get(gameId, since).n;
-
-  const medianPlaytime =
-    db
-      .prepare(
-        `SELECT (last_seen - started_at) AS d FROM sessions
-         WHERE game_id = ? AND started_at >= ?
-         ORDER BY d LIMIT 1
-         OFFSET (SELECT COUNT(*) FROM sessions WHERE game_id = ? AND started_at >= ?) / 2`
-      )
-      .get(gameId, since, gameId, since)?.d ?? 0;
-
-  const daily = db
-    .prepare(
+       WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')`,
+      [gameId, since]
+    ),
+    get(
+      `SELECT (last_seen - started_at) AS d FROM sessions
+       WHERE game_id = ? AND started_at >= ?
+       ORDER BY d LIMIT 1
+       OFFSET (SELECT COUNT(*) FROM sessions WHERE game_id = ? AND started_at >= ?) / 2`,
+      [gameId, since, gameId, since]
+    ),
+    all(
       `SELECT date(started_at, 'unixepoch') AS day,
               COUNT(*) AS sessions,
               COUNT(DISTINCT player_id) AS players
        FROM sessions WHERE game_id = ? AND started_at >= ?
-       GROUP BY day ORDER BY day`
-    )
-    .all(gameId, since);
-
-  const breakdown = (col) =>
-    db
-      .prepare(
-        `SELECT COALESCE(${col}, 'Unknown') AS label, COUNT(*) AS n
-         FROM sessions WHERE game_id = ? AND started_at >= ?
-         GROUP BY label ORDER BY n DESC LIMIT 8`
-      )
-      .all(gameId, since);
-
-  const topEvents = db
-    .prepare(
+       GROUP BY day ORDER BY day`,
+      [gameId, since]
+    ),
+    breakdown("browser"),
+    breakdown("os"),
+    breakdown("referrer"),
+    all(
       `SELECT name AS label, COUNT(*) AS n FROM events
        WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')
-       GROUP BY name ORDER BY n DESC LIMIT 10`
-    )
-    .all(gameId, since);
-
-  const recentSessions = db
-    .prepare(
-      `SELECT player_id, started_at, (last_seen - started_at) AS duration_s,
-              referrer, browser, os
-       FROM sessions WHERE game_id = ?
-       ORDER BY started_at DESC LIMIT 25`
-    )
-    .all(gameId);
-
-  // Progression funnel: unique players who started each level/wave, read from
-  // the JSON props of level_start / wave_start events (a convention, not a
-  // requirement — games that don't send them get empty arrays and the
-  // dashboard hides the section). Events without a numeric level are skipped
-  // (e.g. editor playtests send level: null).
-  const levelFunnel = db
-    .prepare(
+       GROUP BY name ORDER BY n DESC LIMIT 10`,
+      [gameId, since]
+    ),
+    // Progression funnel: unique players who started each level/wave, read from
+    // the JSON props of level_start / wave_start events (a convention, not a
+    // requirement — games that don't send them get empty arrays and the
+    // dashboard hides the section). Events without a numeric level are skipped
+    // (e.g. editor playtests send level: null).
+    all(
       `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
               MAX(json_extract(props, '$.name')) AS name,
               COUNT(DISTINCT player_id) AS players
        FROM events
        WHERE game_id = ? AND created_at >= ? AND name = 'level_start'
          AND json_extract(props, '$.level') IS NOT NULL
-       GROUP BY level ORDER BY level`
-    )
-    .all(gameId, since);
-
-  const waveFunnel = db
-    .prepare(
+       GROUP BY level ORDER BY level`,
+      [gameId, since]
+    ),
+    all(
       `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
               CAST(json_extract(props, '$.wave') AS INTEGER) AS wave,
               COUNT(DISTINCT player_id) AS players
@@ -199,18 +217,38 @@ export function gameStats(gameId, days = 30) {
        WHERE game_id = ? AND created_at >= ? AND name = 'wave_start'
          AND json_extract(props, '$.level') IS NOT NULL
          AND json_extract(props, '$.wave') IS NOT NULL
-       GROUP BY level, wave ORDER BY level, wave`
-    )
-    .all(gameId, since);
+       GROUP BY level, wave ORDER BY level, wave`,
+      [gameId, since]
+    ),
+    // Build popularity: placements per turret/obstacle type, from the JSON
+    // props of 'build' events (same opt-in convention as the funnel).
+    all(
+      `SELECT COALESCE(json_extract(props, '$.type'), 'unknown') AS label,
+              COUNT(*) AS n,
+              COUNT(DISTINCT player_id) AS players
+       FROM events
+       WHERE game_id = ? AND created_at >= ? AND name = 'build'
+       GROUP BY label ORDER BY n DESC LIMIT 12`,
+      [gameId, since]
+    ),
+    all(
+      `SELECT player_id, started_at, (last_seen - started_at) AS duration_s,
+              referrer, browser, os
+       FROM sessions WHERE game_id = ?
+       ORDER BY started_at DESC LIMIT 25`,
+      [gameId]
+    ),
+  ]);
 
   return {
-    totals: { ...totals, events: eventCount, median_playtime_s: medianPlaytime },
+    totals: { ...totals, events: eventCount.n, median_playtime_s: medianRow?.d ?? 0 },
     daily,
-    browsers: breakdown("browser"),
-    os: breakdown("os"),
-    referrers: breakdown("referrer"),
+    browsers,
+    os,
+    referrers,
     top_events: topEvents,
     progression: { levels: levelFunnel, waves: waveFunnel },
+    builds,
     recent_sessions: recentSessions,
   };
 }

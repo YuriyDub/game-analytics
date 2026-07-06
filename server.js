@@ -54,6 +54,10 @@ function getCookie(req, name) {
 
 const isAuthed = (req) => validToken(getCookie(req, "ga_auth"));
 
+// Express 4 doesn't catch async handler rejections — route them to the error
+// middleware instead of crashing the process.
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 function requireAuth(req, res, next) {
   if (!isAuthed(req)) return res.status(401).json({ error: "unauthorized" });
   next();
@@ -118,7 +122,7 @@ function parseUA(ua = "") {
 }
 
 app.options("/api/collect", collectCors);
-app.post("/api/collect", collectCors, (req, res) => {
+app.post("/api/collect", collectCors, ah(async (req, res) => {
   const n = (hits.get(req.ip) || 0) + 1;
   hits.set(req.ip, n);
   if (n > 120) return res.status(429).json({ error: "rate limited" });
@@ -135,7 +139,7 @@ app.post("/api/collect", collectCors, (req, res) => {
   ) {
     return res.status(400).json({ error: "bad payload" });
   }
-  if (!getGame(game)) return res.status(404).json({ error: "unknown game" });
+  if (!(await getGame(game))) return res.status(404).json({ error: "unknown game" });
 
   const clean = events
     .filter((e) => e && typeof e.name === "string" && e.name.length <= 64)
@@ -148,7 +152,7 @@ app.post("/api/collect", collectCors, (req, res) => {
     }));
 
   const { browser, os } = parseUA(req.headers["user-agent"]);
-  recordBatch(
+  await recordBatch(
     game,
     session,
     player,
@@ -162,27 +166,34 @@ app.post("/api/collect", collectCors, (req, res) => {
     clean
   );
   res.json({ ok: true });
-});
+}));
 
 // ---------- admin API ----------
-app.get("/api/games", requireAuth, (req, res) => res.json(listGames()));
+app.get("/api/games", requireAuth, ah(async (req, res) => res.json(await listGames())));
 
-app.post("/api/games", requireAuth, (req, res) => {
+app.post("/api/games", requireAuth, ah(async (req, res) => {
   const name = String(req.body?.name || "").trim().slice(0, 100);
   if (!name) return res.status(400).json({ error: "name required" });
-  res.json(createGame(name));
-});
+  // Optional explicit id: lets you re-create a game with the id your shipped
+  // clients already carry (e.g. after moving databases).
+  const id = req.body?.id != null ? String(req.body.id) : undefined;
+  if (id !== undefined && !/^[A-Za-z0-9_-]{4,32}$/.test(id)) {
+    return res.status(400).json({ error: "bad id" });
+  }
+  if (id && (await getGame(id))) return res.status(409).json({ error: "id taken" });
+  res.json(await createGame(name, id));
+}));
 
-app.delete("/api/games/:id", requireAuth, (req, res) => {
-  deleteGame(req.params.id);
+app.delete("/api/games/:id", requireAuth, ah(async (req, res) => {
+  await deleteGame(req.params.id);
   res.json({ ok: true });
-});
+}));
 
-app.get("/api/games/:id/stats", requireAuth, (req, res) => {
-  if (!getGame(req.params.id)) return res.status(404).json({ error: "unknown game" });
+app.get("/api/games/:id/stats", requireAuth, ah(async (req, res) => {
+  if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
   const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
-  res.json(gameStats(req.params.id, days));
-});
+  res.json(await gameStats(req.params.id, days));
+}));
 
 app.get("/api/me", (req, res) => res.json({ authed: isAuthed(req) }));
 
@@ -195,6 +206,12 @@ app.get("/gg.js", (req, res) => {
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", isAuthed(req) ? "index.html" : "login.html"));
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "internal error" });
 });
 
 app.listen(PORT, () => console.log(`game-analytics listening on :${PORT}`));

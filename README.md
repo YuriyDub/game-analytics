@@ -12,9 +12,12 @@ that can load a script). One small Node.js server does everything:
   activity-per-day chart, top events, browser/OS/referrer breakdowns, recent
   sessions. Supports multiple games.
 
-Storage is a single SQLite file — no external database to run. No cookies, no
-IP storage, anonymous player IDs; safe to use without a consent banner in most
-setups (verify for your jurisdiction).
+Storage is SQLite via [libSQL](https://github.com/tursodatabase/libsql): a
+single local file by default (no external database to run), or a hosted
+[Turso](https://turso.tech) database when `TURSO_DATABASE_URL` is set — which
+makes hosts with ephemeral disks (like Render's free tier) viable. No cookies,
+no IP storage, anonymous player IDs; safe to use without a consent banner in
+most setups (verify for your jurisdiction).
 
 ## Quick start
 
@@ -60,12 +63,34 @@ Notes for itch.io specifically:
 | `ADMIN_PASSWORD` | **Required.** Dashboard password. |
 | `SECRET` | HMAC key for login cookies. Set it (e.g. `openssl rand -hex 32`) or logins reset on restart. |
 | `PORT` | Default `3000`. |
-| `DATA_DIR` | Where `analytics.db` lives. Default `./data`. |
+| `DATA_DIR` | Where the local `analytics.db` lives. Default `./data`. Ignored when `TURSO_DATABASE_URL` is set. |
+| `TURSO_DATABASE_URL` | Optional. A `libsql://…` URL of a [Turso](https://turso.tech) database; use it on hosts without a persistent disk. |
+| `TURSO_AUTH_TOKEN` | Auth token for the Turso database. |
 
 ## Hosting options
 
-The app is one Node process + one SQLite file, so it needs a host with a
-**persistent disk** (rules out most pure-serverless platforms without changes).
+The app is one Node process + one SQLite file, so it wants a host with a
+**persistent disk** — or, on hosts without one, a hosted
+[Turso](https://turso.tech) database (option 0 below).
+
+### 0. Render free tier + Turso — $0
+
+Render's free web services have no persistent disk (local data is wiped on
+every deploy and idle spin-down), so point the app at Turso's free tier
+instead:
+
+```sh
+# once, locally:
+brew install tursodatabase/tap/turso   # or: curl -sSfL https://get.tur.so/install.sh | bash
+turso auth signup
+turso db create game-analytics
+turso db show game-analytics --url     # -> TURSO_DATABASE_URL
+turso db tokens create game-analytics  # -> TURSO_AUTH_TOKEN
+```
+
+Set both values (plus `ADMIN_PASSWORD` / `SECRET`) in the Render service's
+environment and redeploy. Free-tier spin-downs still add a 30–60 s cold start
+after idle periods, but data now survives them.
 
 ### 1. Fly.io — best fit (~$2–3/mo, can be less)
 
@@ -92,7 +117,7 @@ Push the repo to GitHub, click "new service from repo" — both detect the
 Dockerfile. Attach a **volume** (Railway) or **persistent disk** (Render, paid
 plans) mounted at `/data`, and set the env vars in the UI. Easiest workflow if
 you want zero CLI. Note: Render's free tier has no disk **and** spins down on
-idle (you'd lose data and drop events) — use a paid instance there.
+idle — pair it with Turso (option 0) or use a paid instance there.
 
 ### 3. Any VPS — cheapest at scale (Hetzner ~€4/mo, DigitalOcean $6/mo)
 
@@ -110,8 +135,8 @@ Most control, and one VPS can host many other things too.
 ### 4. Free-tier serverless (Cloudflare Workers + D1) — requires a rewrite
 
 Cloudflare's free tier (100k requests/day, D1 SQLite) would host this for $0,
-but Express and better-sqlite3 don't run on Workers — the server would need a
-port to Hono + D1 bindings. Worth it only if $0 is a hard requirement.
+but Express doesn't run on Workers — the server would need a port to Hono + D1
+bindings. The Render + Turso combo (option 0) gets to $0 with no rewrite.
 
 **Recommendation:** Fly.io if you like the CLI, Railway if you want click-ops,
 Hetzner VPS if you already run one. Whatever you pick, back up
