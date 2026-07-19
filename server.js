@@ -1,5 +1,4 @@
 import express from "express";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,74 +12,14 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
-const SECRET = process.env.SECRET || randomBytes(32).toString("hex");
-
-if (!ADMIN_PASSWORD) {
-  console.warn(
-    "WARNING: ADMIN_PASSWORD is not set — the dashboard is locked. Set it to log in."
-  );
-}
-if (!process.env.SECRET) {
-  console.warn("NOTE: SECRET not set — sessions reset on restart.");
-}
 
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "16kb" }));
 
-// ---------- auth ----------
-const sign = (v) => createHmac("sha256", SECRET).update(v).digest("base64url");
-
-function makeToken() {
-  const payload = `${Date.now()}`;
-  return `${payload}.${sign(payload)}`;
-}
-
-function validToken(token) {
-  if (!token) return false;
-  const [payload, sig] = token.split(".");
-  if (!payload || !sig) return false;
-  const expected = sign(payload);
-  if (sig.length !== expected.length) return false;
-  if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
-  return Date.now() - Number(payload) < 30 * 86400_000; // 30 days
-}
-
-function getCookie(req, name) {
-  const m = (req.headers.cookie || "").match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
-  return m ? m[1] : null;
-}
-
-const isAuthed = (req) => validToken(getCookie(req, "ga_auth"));
-
 // Express 4 doesn't catch async handler rejections — route them to the error
 // middleware instead of crashing the process.
 const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-function requireAuth(req, res, next) {
-  if (!isAuthed(req)) return res.status(401).json({ error: "unauthorized" });
-  next();
-}
-
-app.post("/api/login", (req, res) => {
-  const pw = String(req.body?.password || "");
-  const ok =
-    ADMIN_PASSWORD &&
-    pw.length === ADMIN_PASSWORD.length &&
-    timingSafeEqual(Buffer.from(pw), Buffer.from(ADMIN_PASSWORD));
-  if (!ok) return res.status(401).json({ error: "wrong password" });
-  res.setHeader(
-    "Set-Cookie",
-    `ga_auth=${makeToken()}; HttpOnly; Path=/; Max-Age=${30 * 86400}; SameSite=Lax`
-  );
-  res.json({ ok: true });
-});
-
-app.post("/api/logout", (req, res) => {
-  res.setHeader("Set-Cookie", "ga_auth=; HttpOnly; Path=/; Max-Age=0");
-  res.json({ ok: true });
-});
 
 // ---------- event collection (public, CORS open — games live on itch.zone) ----------
 const collectCors = (req, res, next) => {
@@ -168,10 +107,10 @@ app.post("/api/collect", collectCors, ah(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ---------- admin API ----------
-app.get("/api/games", requireAuth, ah(async (req, res) => res.json(await listGames())));
+// ---------- admin API (unauthenticated — run this on localhost only) ----------
+app.get("/api/games", ah(async (req, res) => res.json(await listGames())));
 
-app.post("/api/games", requireAuth, ah(async (req, res) => {
+app.post("/api/games", ah(async (req, res) => {
   const name = String(req.body?.name || "").trim().slice(0, 100);
   if (!name) return res.status(400).json({ error: "name required" });
   // Optional explicit id: lets you re-create a game with the id your shipped
@@ -184,18 +123,16 @@ app.post("/api/games", requireAuth, ah(async (req, res) => {
   res.json(await createGame(name, id));
 }));
 
-app.delete("/api/games/:id", requireAuth, ah(async (req, res) => {
+app.delete("/api/games/:id", ah(async (req, res) => {
   await deleteGame(req.params.id);
   res.json({ ok: true });
 }));
 
-app.get("/api/games/:id/stats", requireAuth, ah(async (req, res) => {
+app.get("/api/games/:id/stats", ah(async (req, res) => {
   if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
   const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
   res.json(await gameStats(req.params.id, days));
 }));
-
-app.get("/api/me", (req, res) => res.json({ authed: isAuthed(req) }));
 
 // ---------- static ----------
 app.get("/gg.js", (req, res) => {
@@ -205,7 +142,7 @@ app.get("/gg.js", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", isAuthed(req) ? "index.html" : "login.html"));
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 // eslint-disable-next-line no-unused-vars

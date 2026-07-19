@@ -8,7 +8,7 @@ that can load a script). One small Node.js server does everything:
   `GG.track("level_complete", { level: 3 })`.
 - **`/api/collect`** — the ingestion endpoint (CORS-open, since itch.io serves
   games from `html.itch.zone`).
-- **`/`** — a password-protected dashboard: players, sessions, median playtime,
+- **`/`** — an unauthenticated dashboard: players, sessions, median playtime,
   activity-per-day chart, top events, browser/OS/referrer breakdowns, recent
   sessions. Supports multiple games.
 
@@ -23,9 +23,13 @@ most setups (verify for your jurisdiction).
 
 ```sh
 npm install
-ADMIN_PASSWORD=pick-a-password npm start
+npm start
 # open http://localhost:3000
 ```
+
+> **The dashboard has no login.** Anyone who can reach the port can read your
+> stats and delete games. Run it on localhost, or put your own access control
+> (VPN, Caddy `basic_auth`, an SSH tunnel) in front of it before exposing it.
 
 Create a game in the dashboard; it gives you the exact snippet to paste.
 
@@ -60,8 +64,6 @@ Notes for itch.io specifically:
 
 | Env var | Meaning |
 |---|---|
-| `ADMIN_PASSWORD` | **Required.** Dashboard password. |
-| `SECRET` | HMAC key for login cookies. Set it (e.g. `openssl rand -hex 32`) or logins reset on restart. |
 | `PORT` | Default `3000`. |
 | `DATA_DIR` | Where the local `analytics.db` lives. Default `./data`. Ignored when `TURSO_DATABASE_URL` is set. |
 | `TURSO_DATABASE_URL` | Optional. A `libsql://…` URL of a [Turso](https://turso.tech) database; use it on hosts without a persistent disk. |
@@ -88,7 +90,7 @@ turso db show game-analytics --url     # -> TURSO_DATABASE_URL
 turso db tokens create game-analytics  # -> TURSO_AUTH_TOKEN
 ```
 
-Set both values (plus `ADMIN_PASSWORD` / `SECRET`) in the Render service's
+Set both values in the Render service's
 environment and redeploy. Free-tier spin-downs still add a 30–60 s cold start
 after idle periods, but data now survives them.
 
@@ -99,7 +101,6 @@ Runs a tiny VM close to your players, persistent volume for SQLite, free TLS.
 ```sh
 fly launch --no-deploy          # detects the Dockerfile
 fly volumes create data --size 1
-fly secrets set ADMIN_PASSWORD=... SECRET=$(openssl rand -hex 32)
 fly deploy
 ```
 
@@ -125,7 +126,7 @@ idle — pair it with Turso (option 0) or use a paid instance there.
 docker build -t game-analytics .
 docker run -d --restart unless-stopped -p 127.0.0.1:3000:3000 \
   -v /srv/analytics-data:/data \
-  -e ADMIN_PASSWORD=... -e SECRET=... game-analytics
+  game-analytics
 ```
 
 Put [Caddy](https://caddyserver.com) in front for automatic HTTPS —
@@ -146,6 +147,5 @@ Hetzner VPS if you already run one. Whatever you pick, back up
 ## API sketch
 
 - `POST /api/collect` — `{ game, session, player, meta, events: [{name, props?}] }` (public, rate-limited)
-- `POST /api/login` / `POST /api/logout`
-- `GET /api/games` · `POST /api/games` · `DELETE /api/games/:id` (auth)
-- `GET /api/games/:id/stats?days=30` (auth)
+- `GET /api/games` · `POST /api/games` · `DELETE /api/games/:id` (no auth)
+- `GET /api/games/:id/stats?days=30` (no auth)
