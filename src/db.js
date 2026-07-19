@@ -172,11 +172,15 @@ export async function gameStats(gameId, days = 30) {
        WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')`,
       [gameId, since]
     ),
+    // Median playtime over engaged sessions only — bounces (< 1 min) are
+    // excluded so the tile reflects players who actually played.
     get(
       `SELECT (last_seen - started_at) AS d FROM sessions
-       WHERE game_id = ? AND started_at >= ?
+       WHERE game_id = ? AND started_at >= ? AND (last_seen - started_at) >= 60
        ORDER BY d LIMIT 1
-       OFFSET (SELECT COUNT(*) FROM sessions WHERE game_id = ? AND started_at >= ?) / 2`,
+       OFFSET (SELECT COUNT(*) FROM sessions
+               WHERE game_id = ? AND started_at >= ?
+                 AND (last_seen - started_at) >= 60) / 2`,
       [gameId, since, gameId, since]
     ),
     all(

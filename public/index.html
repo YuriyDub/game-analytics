@@ -59,6 +59,11 @@
   svg text.cat { fill: var(--ink); font-size: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; color: var(--ink-2); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--grid); }
+  th[data-sort] { cursor: pointer; user-select: none; white-space: nowrap; }
+  th[data-sort]:hover { color: var(--ink); }
+  th[data-sort]::after { content: "↕"; opacity: .25; margin-left: 5px; font-size: 11px; }
+  th[data-sort].asc::after { content: "↑"; opacity: 1; }
+  th[data-sort].desc::after { content: "↓"; opacity: 1; }
   td { padding: 6px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
   td.mut { color: var(--ink-2); }
   .empty { color: var(--muted); padding: 24px 0; text-align: center; }
@@ -114,7 +119,7 @@
   <div class="tiles">
     <div class="card tile"><div class="label">Unique players</div><div class="value" id="tPlayers">–</div></div>
     <div class="card tile"><div class="label">Sessions</div><div class="value" id="tSessions">–</div></div>
-    <div class="card tile"><div class="label">Median playtime</div><div class="value" id="tPlaytime">–</div></div>
+    <div class="card tile"><div class="label">Median playtime (&ge;1 min)</div><div class="value" id="tPlaytime">–</div></div>
     <div class="card tile"><div class="label">Custom events</div><div class="value" id="tEvents">–</div></div>
   </div>
 
@@ -162,7 +167,14 @@
     <h2>Recent sessions</h2>
     <div style="overflow-x:auto">
       <table id="sessionsTable">
-        <thead><tr><th>Started</th><th>Player</th><th>Duration</th><th>Browser</th><th>OS</th><th>Referrer</th></tr></thead>
+        <thead><tr>
+          <th data-sort="started_at" class="desc">Started</th>
+          <th data-sort="player_id">Player</th>
+          <th data-sort="duration_s">Duration</th>
+          <th data-sort="browser">Browser</th>
+          <th data-sort="os">OS</th>
+          <th data-sort="referrer">Referrer</th>
+        </tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -193,6 +205,7 @@
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const tooltip = $("#tooltip");
 let games = [], gameId = null, days = 30;
@@ -380,15 +393,46 @@ async function loadStats() {
   renderBars($("#browsersChart"), s.browsers, s.totals.sessions);
   renderBars($("#referrersChart"), s.referrers, s.totals.sessions);
   renderBars($("#osChart"), s.os, s.totals.sessions);
-  $("#sessionsTable tbody").innerHTML = s.recent_sessions.map(r =>
-    `<tr><td class="mut">${new Date(r.started_at * 1000).toLocaleString()}</td>` +
-    `<td class="mut">${esc(r.player_id.slice(0, 8))}</td><td>${fmtDur(r.duration_s)}</td>` +
-    `<td>${esc(r.browser || "–")}</td><td>${esc(r.os || "–")}</td><td class="mut">${esc(r.referrer || "–")}</td></tr>`
-  ).join("") || '<tr><td colspan="6" class="empty">No sessions yet.</td></tr>';
+  sessions = s.recent_sessions;
+  renderSessions();
   const snippet = `<script src="${location.origin}/gg.js" data-game="${gameId}"><\/script>`;
   $("#snippet").textContent = snippet;
   $("#copySnippet").onclick = () => navigator.clipboard.writeText(snippet);
 }
+
+// Recent-sessions table sorting. The rows are the 25 the API already returned,
+// so this re-orders what's on screen — it does not fetch a different slice.
+let sessions = [];
+let sortKey = "started_at", sortDir = -1;
+
+function renderSessions() {
+  const rows = sessions.slice().sort((a, b) => {
+    const x = a[sortKey], y = b[sortKey];
+    if (x == null && y == null) return 0;
+    if (x == null) return 1;   // blanks last, whichever direction
+    if (y == null) return -1;
+    const c = typeof x === "number" ? x - y : String(x).localeCompare(String(y));
+    return c * sortDir;
+  });
+  $("#sessionsTable tbody").innerHTML = rows.map(r =>
+    `<tr><td class="mut">${new Date(r.started_at * 1000).toLocaleString()}</td>` +
+    `<td class="mut">${esc(r.player_id.slice(0, 8))}</td><td>${fmtDur(r.duration_s)}</td>` +
+    `<td>${esc(r.browser || "–")}</td><td>${esc(r.os || "–")}</td><td class="mut">${esc(r.referrer || "–")}</td></tr>`
+  ).join("") || '<tr><td colspan="6" class="empty">No sessions yet.</td></tr>';
+}
+
+$$("#sessionsTable th[data-sort]").forEach(th => {
+  th.onclick = () => {
+    const key = th.dataset.sort;
+    // Same column toggles direction; a new column starts descending for
+    // numbers (biggest first) and ascending for text (A–Z).
+    if (key === sortKey) sortDir = -sortDir;
+    else { sortKey = key; sortDir = key === "started_at" || key === "duration_s" ? -1 : 1; }
+    $$("#sessionsTable th[data-sort]").forEach(h => h.classList.remove("asc", "desc"));
+    th.classList.add(sortDir === 1 ? "asc" : "desc");
+    renderSessions();
+  };
+});
 
 function renderGameSel() {
   $("#gameSel").innerHTML = games.map(g =>
