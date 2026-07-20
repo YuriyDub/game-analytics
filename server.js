@@ -7,6 +7,7 @@ import {
   gameStats,
   getGame,
   listGames,
+  playerRows,
   recordBatch,
 } from "./src/db.js";
 
@@ -132,6 +133,19 @@ app.get("/api/games/:id/stats", ah(async (req, res) => {
   if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
   const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
   res.json(await gameStats(req.params.id, days));
+}));
+
+// Paged + sorted player list. Unknown sort keys fall back to a default in the
+// query layer, so a bad param degrades instead of erroring.
+app.get("/api/games/:id/players", ah(async (req, res) => {
+  if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
+  const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
+  res.json(await playerRows(req.params.id, days, {
+    sort: req.query.sort,
+    dir: req.query.dir,
+    limit: Number(req.query.limit) || 25,
+    offset: Number(req.query.offset) || 0,
+  }));
 }));
 
 // ---------- static ----------

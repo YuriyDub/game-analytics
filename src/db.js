@@ -135,6 +135,56 @@ export async function recordBatch(gameId, sessionId, playerId, meta, events) {
 // derives its labels from the bucket index, so both ends must agree.
 const BUCKET_MAX = 20;
 
+// Per-player table. Sorting and paging both happen in SQL so the order is over
+// every player in the period, not just the rows on the current page.
+const PLAYER_SORTS = {
+  player_id: "s.player_id",
+  sessions: "sessions",
+  playtime_s: "playtime_s",
+  events: "events",
+  first_seen: "first_seen",
+  last_seen: "last_seen",
+};
+
+export async function playerRows(gameId, days = 30, opts = {}) {
+  const since = now() - days * 86400;
+  const col = PLAYER_SORTS[opts.sort] || PLAYER_SORTS.last_seen;
+  const dir = opts.dir === "asc" ? "ASC" : "DESC";
+  const limit = Math.min(100, Math.max(1, opts.limit || 25));
+  const offset = Math.max(0, opts.offset || 0);
+
+  const [countRow, rows] = await Promise.all([
+    get(
+      `SELECT COUNT(DISTINCT player_id) AS n FROM sessions
+       WHERE game_id = ? AND started_at >= ?`,
+      [gameId, since]
+    ),
+    // The events join is grouped by player, so it stays 1:1 with each player
+    // group and can't inflate the session COUNT(*).
+    all(
+      `SELECT s.player_id,
+              COUNT(*) AS sessions,
+              SUM(s.last_seen - s.started_at) AS playtime_s,
+              MIN(s.started_at) AS first_seen,
+              MAX(s.last_seen) AS last_seen,
+              COALESCE(e.n, 0) AS events
+       FROM sessions s
+       LEFT JOIN (
+         SELECT player_id, COUNT(*) AS n FROM events
+         WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')
+         GROUP BY player_id
+       ) e ON e.player_id = s.player_id
+       WHERE s.game_id = ? AND s.started_at >= ?
+       GROUP BY s.player_id
+       ORDER BY ${col} ${dir}, s.player_id ASC
+       LIMIT ? OFFSET ?`,
+      [gameId, since, gameId, since, limit, offset]
+    ),
+  ]);
+
+  return { total: countRow.n, offset, limit, rows };
+}
+
 export async function gameStats(gameId, days = 30) {
   const since = now() - days * 86400;
 

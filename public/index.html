@@ -67,6 +67,12 @@
   td { padding: 6px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
   td.mut { color: var(--ink-2); }
   .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  .pager {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px;
+    font-size: 13px; color: var(--ink-2);
+  }
+  .pager span { margin-right: auto; font-variant-numeric: tabular-nums; }
+  .pager button[disabled] { opacity: .4; cursor: default; }
   #tooltip {
     position: fixed; pointer-events: none; z-index: 10; display: none;
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
@@ -166,6 +172,28 @@
     <div class="card"><h2>Browsers</h2><div id="browsersChart"></div></div>
     <div class="card"><h2>Referrers</h2><div id="referrersChart"></div></div>
     <div class="card"><h2>Operating systems</h2><div id="osChart"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>Players</h2>
+    <div style="overflow-x:auto">
+      <table id="playersTable">
+        <thead><tr>
+          <th data-sort="player_id">Player</th>
+          <th data-sort="sessions">Sessions</th>
+          <th data-sort="playtime_s">Playtime</th>
+          <th data-sort="events">Events</th>
+          <th data-sort="first_seen">First seen</th>
+          <th data-sort="last_seen" class="desc">Last seen</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span id="playersRange"></span>
+      <button class="btn" id="playersPrev">← Prev</button>
+      <button class="btn" id="playersNext">Next →</button>
+    </div>
   </div>
 
   <div class="card">
@@ -470,6 +498,48 @@ async function loadStats() {
   $("#copySnippet").onclick = () => navigator.clipboard.writeText(snippet);
 }
 
+// ---- players table ----
+// Unlike the recent-sessions table below, this one sorts and pages in SQL:
+// clicking a header re-queries so the order covers every player in the period,
+// not just the rows currently on screen.
+const PAGE = 25;
+let pSort = "last_seen", pDir = "desc", pOffset = 0, pTotal = 0;
+
+async function loadPlayers() {
+  if (!gameId) return;
+  const r = await api(`/api/games/${gameId}/players` +
+    `?days=${days}&sort=${pSort}&dir=${pDir}&limit=${PAGE}&offset=${pOffset}`);
+  pTotal = r.total;
+  $("#playersTable tbody").innerHTML = r.rows.map(p =>
+    `<tr><td class="mut">${esc(p.player_id.slice(0, 8))}</td>` +
+    `<td>${p.sessions.toLocaleString()}</td><td>${fmtDur(p.playtime_s)}</td>` +
+    `<td>${p.events.toLocaleString()}</td>` +
+    `<td class="mut">${new Date(p.first_seen * 1000).toLocaleString()}</td>` +
+    `<td class="mut">${new Date(p.last_seen * 1000).toLocaleString()}</td></tr>`
+  ).join("") || '<tr><td colspan="6" class="empty">No players in this period yet.</td></tr>';
+  $("#playersRange").textContent = pTotal
+    ? `${(pOffset + 1).toLocaleString()}–${Math.min(pOffset + PAGE, pTotal).toLocaleString()} of ${pTotal.toLocaleString()}`
+    : "";
+  $("#playersPrev").disabled = pOffset === 0;
+  $("#playersNext").disabled = pOffset + PAGE >= pTotal;
+}
+
+$$("#playersTable th[data-sort]").forEach(th => {
+  th.onclick = () => {
+    const key = th.dataset.sort;
+    if (key === pSort) pDir = pDir === "asc" ? "desc" : "asc";
+    else { pSort = key; pDir = key === "player_id" ? "asc" : "desc"; }
+    pOffset = 0; // a new order makes the old page number meaningless
+    $$("#playersTable th[data-sort]").forEach(h => h.classList.remove("asc", "desc"));
+    th.classList.add(pDir);
+    loadPlayers();
+  };
+});
+$("#playersPrev").onclick = () => { pOffset = Math.max(0, pOffset - PAGE); loadPlayers(); };
+$("#playersNext").onclick = () => {
+  if (pOffset + PAGE < pTotal) { pOffset += PAGE; loadPlayers(); }
+};
+
 // Recent-sessions table sorting. The rows are the 25 the API already returned,
 // so this re-orders what's on screen — it does not fetch a different slice.
 let sessions = [];
@@ -517,16 +587,21 @@ async function loadGames() {
   if (!hasGames) return;
   if (!gameId || !games.some(g => g.id === gameId)) gameId = games[0].id;
   renderGameSel();
-  await loadStats();
+  await Promise.all([loadStats(), loadPlayers()]);
 }
 
 // ---- wiring ----
-$("#gameSel").addEventListener("change", (e) => { gameId = e.target.value; loadStats(); });
+$("#gameSel").addEventListener("change", (e) => {
+  gameId = e.target.value;
+  pOffset = 0;
+  loadStats(); loadPlayers();
+});
 $("#range").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (!b) return;
   days = +b.dataset.d;
   document.querySelectorAll("#range button").forEach(x => x.classList.toggle("on", x === b));
-  loadStats();
+  pOffset = 0;
+  loadStats(); loadPlayers();
 });
 const dlg = $("#newGameDlg");
 $("#newGame").addEventListener("click", () => dlg.showModal());
