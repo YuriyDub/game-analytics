@@ -134,6 +134,11 @@
 
   <!-- Shown only when the game sends level_start / wave_start events with
        {level, wave} props (see the funnel queries in src/db.js). -->
+  <div class="card">
+    <h2>Players bucketed by time played</h2>
+    <div id="playtimeChart"></div>
+  </div>
+
   <div class="grid-2" id="progression" hidden>
     <div class="card"><h2>Levels reached · unique players</h2><div id="levelsChart"></div></div>
     <div class="card">
@@ -338,6 +343,70 @@ function renderBars(el, items, total) {
   });
 }
 
+// ---- playtime histogram: players per 10-minute bucket ----
+function renderPlaytime(el, pt) {
+  el.innerHTML = "";
+  const step = pt.bucket_minutes;
+  const byBucket = Object.fromEntries(pt.buckets.map(b => [b.bucket, b.players]));
+  // Always show through the last non-empty bucket so the tail's shape is visible,
+  // but keep at least 10 columns so a low-playtime game still reads as a chart.
+  const last = Math.max(9, ...pt.buckets.map(b => b.bucket));
+  const rows = [];
+  for (let i = 0; i <= last; i++) {
+    rows.push({
+      label: i === pt.max_bucket ? `${i * step}+ min` : `${i * step + 1}–${(i + 1) * step} min`,
+      n: byBucket[i] || 0,
+    });
+  }
+  if (!pt.buckets.length) { el.innerHTML = '<div class="empty">No sessions in this period yet.</div>'; return; }
+
+  const W = el.clientWidth || 900, H = 240, L = 44, R = 12, T = 10, B = 88;
+  const iw = W - L - R, ih = H - T - B;
+  const maxV = Math.max(1, ...rows.map(r => r.n));
+  let tick = 1;
+  while (Math.ceil(maxV / tick) > 4) tick *= ("" + tick)[0] === "2" ? 2.5 : 2;
+  const divs = Math.ceil(maxV / tick);
+  const top = tick * divs;
+  const y = (v) => T + ih - v / top * ih;
+  const slot = iw / rows.length, bw = Math.max(2, slot - 4);
+
+  let g = "";
+  for (let t = 0; t <= divs; t++) {
+    const v = tick * t, yy = y(v);
+    g += `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="var(--grid)" stroke-width="1"/>` +
+         `<text x="${L-6}" y="${yy+3}" text-anchor="end">${fmtN(v)}</text>`;
+  }
+  let bars = "";
+  rows.forEach((r, i) => {
+    const x = L + i * slot + (slot - bw) / 2, h = r.n / top * ih;
+    bars +=
+      `<g class="col" data-i="${i}">
+        ${r.n ? `<rect x="${x.toFixed(1)}" y="${y(r.n).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="var(--series-1)" rx="2"/>` : ""}
+        <text x="${(x + bw/2).toFixed(1)}" y="${T+ih+8}" text-anchor="end"
+              transform="rotate(-90 ${(x + bw/2).toFixed(1)} ${T+ih+8})">${r.label}</text>
+        <rect x="${(L + i*slot).toFixed(1)}" y="${T}" width="${slot.toFixed(1)}" height="${ih}" fill="transparent"/>
+      </g>`;
+  });
+  el.innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Players bucketed by time played">
+      ${g}${bars}
+      <line x1="${L}" y1="${y(0)}" x2="${W-R}" y2="${y(0)}" stroke="var(--baseline)" stroke-width="1"/>
+    </svg>`;
+
+  const totalPlayers = rows.reduce((a, r) => a + r.n, 0);
+  el.querySelectorAll(".col").forEach(gr => {
+    gr.addEventListener("mousemove", (e) => {
+      const r = rows[+gr.dataset.i];
+      const pct = totalPlayers ? Math.round(r.n / totalPlayers * 100) : 0;
+      showTooltip(
+        `<div style="color:var(--ink-2);margin-bottom:4px">${r.label}</div>` +
+        `<div class="row">Players <b>${r.n.toLocaleString()} · ${pct}%</b></div>`,
+        e.clientX, e.clientY);
+    });
+    gr.addEventListener("mouseleave", hideTooltip);
+  });
+}
+
 // ---- progression funnel: levels & waves reached ----
 let waveLevel = null, lastProgression = null, lastTotalPlayers = null;
 function renderProgression(p, totalPlayers) {
@@ -373,6 +442,7 @@ async function loadStats() {
   $("#tPlaytime").textContent = fmtDur(s.totals.median_playtime_s);
   $("#tEvents").textContent = fmtN(s.totals.events);
   renderLine($("#lineChart"), s.daily);
+  renderPlaytime($("#playtimeChart"), s.playtime);
   renderProgression(s.progression, s.totals.players);
   $("#buildsCard").hidden = !s.builds.length;
   renderBars($("#buildsChart"), s.builds.map(b => ({

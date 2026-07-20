@@ -131,6 +131,10 @@ export async function recordBatch(gameId, sessionId, playerId, meta, events) {
   await db.batch(stmts, "write");
 }
 
+// Last bucket of the playtime histogram (20 → "200+ min"); the dashboard
+// derives its labels from the bucket index, so both ends must agree.
+const BUCKET_MAX = 20;
+
 export async function gameStats(gameId, days = 30) {
   const since = now() - days * 86400;
 
@@ -158,6 +162,7 @@ export async function gameStats(gameId, days = 30) {
     builds,
     upgrades,
     economy,
+    playtime,
     recentSessions,
   ] = await Promise.all([
     get(
@@ -259,6 +264,17 @@ export async function gameStats(gameId, days = 30) {
        GROUP BY min ORDER BY min`,
       [gameId, since]
     ),
+    // Playtime histogram: players bucketed by their TOTAL time played across
+    // all sessions in the period, in 10-minute buckets. Everything past
+    // BUCKET_MAX lands in the final overflow bucket.
+    all(
+      `SELECT bucket, COUNT(*) AS players FROM (
+         SELECT MIN(SUM(last_seen - started_at) / 600, ${BUCKET_MAX}) AS bucket
+         FROM sessions WHERE game_id = ? AND started_at >= ?
+         GROUP BY player_id
+       ) GROUP BY bucket ORDER BY bucket`,
+      [gameId, since]
+    ),
     all(
       `SELECT player_id, started_at, (last_seen - started_at) AS duration_s,
               referrer, browser, os
@@ -279,6 +295,7 @@ export async function gameStats(gameId, days = 30) {
     builds,
     upgrades,
     economy,
+    playtime: { bucket_minutes: 10, max_bucket: BUCKET_MAX, buckets: playtime },
     recent_sessions: recentSessions,
   };
 }
