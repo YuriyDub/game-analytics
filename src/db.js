@@ -131,6 +131,11 @@ export async function recordBatch(gameId, sessionId, playerId, meta, events) {
   await db.batch(stmts, "write");
 }
 
+// Sessions longer than this are treated as idle-tab outliers and left out of
+// the median playtime tile. Only the median uses it — the playtime histogram
+// and the players table still show these sessions.
+const MEDIAN_CAP_S = 2 * 3600;
+
 // Last bucket of the playtime histogram (20 → "200+ min"); the dashboard
 // derives its labels from the bucket index, so both ends must agree.
 const BUCKET_MAX = 20;
@@ -227,15 +232,21 @@ export async function gameStats(gameId, days = 30) {
        WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')`,
       [gameId, since]
     ),
-    // Median playtime over engaged sessions only — bounces (< 1 min) are
-    // excluded so the tile reflects players who actually played.
+    // Median playtime over engaged sessions only: bounces (< 1 min) are
+    // excluded so the tile reflects players who actually played, and sessions
+    // over MEDIAN_CAP_S are dropped as outliers — playtime is measured by
+    // heartbeat, so a tab left open all day reads as one enormous session.
+    // The filter must stay identical in the OFFSET subquery, which counts the
+    // same population the outer query orders; if they drift, the offset lands
+    // on the wrong row and the "median" is silently not the median.
     get(
       `SELECT (last_seen - started_at) AS d FROM sessions
-       WHERE game_id = ? AND started_at >= ? AND (last_seen - started_at) >= 60
+       WHERE game_id = ? AND started_at >= ?
+         AND (last_seen - started_at) BETWEEN 60 AND ${MEDIAN_CAP_S}
        ORDER BY d LIMIT 1
        OFFSET (SELECT COUNT(*) FROM sessions
                WHERE game_id = ? AND started_at >= ?
-                 AND (last_seen - started_at) >= 60) / 2`,
+                 AND (last_seen - started_at) BETWEEN 60 AND ${MEDIAN_CAP_S}) / 2`,
       [gameId, since, gameId, since]
     ),
     all(
