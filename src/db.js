@@ -61,6 +61,22 @@ await db.batch(
 
 const now = () => Math.floor(Date.now() / 1000);
 
+// Local dev playtests are hidden from every read below (the data stays in the
+// database). A session is local when its referrer is a loopback host — gg.js
+// falls back to location.hostname when document.referrer is empty, so a game
+// served from localhost reads as 'localhost'. Events have no referrer of their
+// own and are filtered through their session.
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"];
+const ref = "COALESCE(referrer, '')";
+const IS_LOCAL = `(${[
+  `${ref} IN (${LOCAL_HOSTS.flatMap((h) => [h, `http://${h}`, `https://${h}`]).map((v) => `'${v}'`).join(", ")})`,
+  ...LOCAL_HOSTS.flatMap((h) =>
+    ["http", "https"].flatMap((proto) => [`${ref} LIKE '${proto}://${h}:%'`, `${ref} LIKE '${proto}://${h}/%'`])
+  ),
+].join(" OR ")})`;
+const REAL_SESSION = `NOT ${IS_LOCAL}`;
+const REAL_EVENT = `session_id NOT IN (SELECT id FROM sessions WHERE ${IS_LOCAL})`;
+
 // id is optional so a game can be re-created with a known id (e.g. after
 // moving databases) — shipped clients keep reporting without a rebuild.
 export async function createGame(name, id) {
@@ -79,8 +95,8 @@ export function getGame(id) {
 export function listGames() {
   return all(
     `SELECT g.*,
-            (SELECT COUNT(*) FROM sessions s WHERE s.game_id = g.id) AS sessions,
-            (SELECT COUNT(DISTINCT player_id) FROM sessions s WHERE s.game_id = g.id) AS players
+            (SELECT COUNT(*) FROM sessions s WHERE s.game_id = g.id AND ${REAL_SESSION}) AS sessions,
+            (SELECT COUNT(DISTINCT player_id) FROM sessions s WHERE s.game_id = g.id AND ${REAL_SESSION}) AS players
      FROM games g ORDER BY g.created_at DESC`
   );
 }
@@ -161,7 +177,7 @@ export async function playerRows(gameId, days = 30, opts = {}) {
   const [countRow, rows] = await Promise.all([
     get(
       `SELECT COUNT(DISTINCT player_id) AS n FROM sessions
-       WHERE game_id = ? AND started_at >= ?`,
+       WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}`,
       [gameId, since]
     ),
     // The events join is grouped by player, so it stays 1:1 with each player
@@ -176,10 +192,10 @@ export async function playerRows(gameId, days = 30, opts = {}) {
        FROM sessions s
        LEFT JOIN (
          SELECT player_id, COUNT(*) AS n FROM events
-         WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')
+         WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')
          GROUP BY player_id
        ) e ON e.player_id = s.player_id
-       WHERE s.game_id = ? AND s.started_at >= ?
+       WHERE s.game_id = ? AND s.started_at >= ? AND ${REAL_SESSION}
        GROUP BY s.player_id
        ORDER BY ${col} ${dir}, s.player_id ASC
        LIMIT ? OFFSET ?`,
@@ -196,7 +212,7 @@ export async function gameStats(gameId, days = 30) {
   const breakdown = (col) =>
     all(
       `SELECT COALESCE(${col}, 'Unknown') AS label, COUNT(*) AS n
-       FROM sessions WHERE game_id = ? AND started_at >= ?
+       FROM sessions WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}
        GROUP BY label ORDER BY n DESC LIMIT 8`,
       [gameId, since]
     );
@@ -224,12 +240,12 @@ export async function gameStats(gameId, days = 30) {
       `SELECT COUNT(*) AS sessions,
               COUNT(DISTINCT player_id) AS players,
               COALESCE(SUM(last_seen - started_at), 0) AS playtime_s
-       FROM sessions WHERE game_id = ? AND started_at >= ?`,
+       FROM sessions WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}`,
       [gameId, since]
     ),
     get(
       `SELECT COUNT(*) AS n FROM events
-       WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')`,
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')`,
       [gameId, since]
     ),
     // Median playtime over engaged sessions only: bounces (< 1 min) are
@@ -241,11 +257,11 @@ export async function gameStats(gameId, days = 30) {
     // on the wrong row and the "median" is silently not the median.
     get(
       `SELECT (last_seen - started_at) AS d FROM sessions
-       WHERE game_id = ? AND started_at >= ?
+       WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}
          AND (last_seen - started_at) BETWEEN 60 AND ${MEDIAN_CAP_S}
        ORDER BY d LIMIT 1
        OFFSET (SELECT COUNT(*) FROM sessions
-               WHERE game_id = ? AND started_at >= ?
+               WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}
                  AND (last_seen - started_at) BETWEEN 60 AND ${MEDIAN_CAP_S}) / 2`,
       [gameId, since, gameId, since]
     ),
@@ -253,7 +269,7 @@ export async function gameStats(gameId, days = 30) {
       `SELECT date(started_at, 'unixepoch') AS day,
               COUNT(*) AS sessions,
               COUNT(DISTINCT player_id) AS players
-       FROM sessions WHERE game_id = ? AND started_at >= ?
+       FROM sessions WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}
        GROUP BY day ORDER BY day`,
       [gameId, since]
     ),
@@ -262,7 +278,7 @@ export async function gameStats(gameId, days = 30) {
     breakdown("referrer"),
     all(
       `SELECT name AS label, COUNT(*) AS n FROM events
-       WHERE game_id = ? AND created_at >= ? AND name NOT IN ('session_start')
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')
        GROUP BY name ORDER BY n DESC LIMIT 10`,
       [gameId, since]
     ),
@@ -276,7 +292,7 @@ export async function gameStats(gameId, days = 30) {
               MAX(json_extract(props, '$.name')) AS name,
               COUNT(DISTINCT player_id) AS players
        FROM events
-       WHERE game_id = ? AND created_at >= ? AND name = 'level_start'
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'level_start'
          AND json_extract(props, '$.level') IS NOT NULL
        GROUP BY level ORDER BY level`,
       [gameId, since]
@@ -286,7 +302,7 @@ export async function gameStats(gameId, days = 30) {
               CAST(json_extract(props, '$.wave') AS INTEGER) AS wave,
               COUNT(DISTINCT player_id) AS players
        FROM events
-       WHERE game_id = ? AND created_at >= ? AND name = 'wave_start'
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'wave_start'
          AND json_extract(props, '$.level') IS NOT NULL
          AND json_extract(props, '$.wave') IS NOT NULL
        GROUP BY level, wave ORDER BY level, wave`,
@@ -299,7 +315,7 @@ export async function gameStats(gameId, days = 30) {
               COUNT(*) AS n,
               COUNT(DISTINCT player_id) AS players
        FROM events
-       WHERE game_id = ? AND created_at >= ? AND name = 'build'
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'build'
        GROUP BY label ORDER BY n DESC LIMIT 12`,
       [gameId, since]
     ),
@@ -309,7 +325,7 @@ export async function gameStats(gameId, days = 30) {
               COUNT(*) AS n,
               COUNT(DISTINCT player_id) AS players
        FROM events
-       WHERE game_id = ? AND created_at >= ? AND name = 'upgrade'
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'upgrade'
        GROUP BY label ORDER BY n DESC LIMIT 15`,
       [gameId, since]
     ),
@@ -320,7 +336,7 @@ export async function gameStats(gameId, days = 30) {
               ROUND(AVG(json_extract(props, '$.crystals'))) AS avg_crystals,
               COUNT(DISTINCT player_id) AS players
        FROM events
-       WHERE game_id = ? AND created_at >= ? AND name = 'currency_milestone'
+       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'currency_milestone'
          AND json_extract(props, '$.min') IS NOT NULL
        GROUP BY min ORDER BY min`,
       [gameId, since]
@@ -331,7 +347,7 @@ export async function gameStats(gameId, days = 30) {
     all(
       `SELECT bucket, COUNT(*) AS players FROM (
          SELECT MIN(SUM(last_seen - started_at) / 600, ${BUCKET_MAX}) AS bucket
-         FROM sessions WHERE game_id = ? AND started_at >= ?
+         FROM sessions WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}
          GROUP BY player_id
        ) GROUP BY bucket ORDER BY bucket`,
       [gameId, since]
@@ -339,7 +355,7 @@ export async function gameStats(gameId, days = 30) {
     all(
       `SELECT player_id, started_at, (last_seen - started_at) AS duration_s,
               referrer, browser, os
-       FROM sessions WHERE game_id = ?
+       FROM sessions WHERE game_id = ? AND ${REAL_SESSION}
        ORDER BY started_at DESC LIMIT 25`,
       [gameId]
     ),
