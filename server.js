@@ -61,11 +61,27 @@ function parseUA(ua = "") {
   return { browser, os };
 }
 
+// Dev playtests (game served from localhost) shouldn't count as players. The
+// browser sets Origin on cross-origin POSTs (and Referer as a fallback), so
+// this also catches clients running an older cached gg.js.
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "0.0.0.0"]);
+function isLocalOrigin(req) {
+  const src = req.headers.origin || req.headers.referer;
+  if (!src) return false;
+  try {
+    const host = new URL(src).hostname;
+    return LOCAL_HOSTS.has(host) || host.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+
 app.options("/api/collect", collectCors);
 app.post("/api/collect", collectCors, ah(async (req, res) => {
   const n = (hits.get(req.ip) || 0) + 1;
   hits.set(req.ip, n);
   if (n > 120) return res.status(429).json({ error: "rate limited" });
+  if (isLocalOrigin(req)) return res.json({ ok: true, ignored: "localhost" });
 
   const { game, session, player, meta = {}, events } = req.body || {};
   if (

@@ -20,6 +20,11 @@
     window.GG = { track: function () {} };
     return;
   }
+  var h = location.hostname;
+  if (h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "0.0.0.0" || /\.localhost$/.test(h)) {
+    window.GG = { track: function () {} }; // local dev playtest — don't count it
+    return;
+  }
   var ENDPOINT = HOST + "/api/collect";
 
   function rid() {
