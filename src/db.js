@@ -206,6 +206,154 @@ export async function playerRows(gameId, days = 30, opts = {}) {
   return { total: countRow.n, offset, limit, rows };
 }
 
+// ---------- performance & stability ----------
+// Reads the telemetry convention a game can opt into (Swarmbreaker does):
+//   boot      {ms, gpu:{v,a,d}, os, ...}  once per page load that got in
+//   boot_fail {reason, os, ...}           a page load that never got in
+//   perf      {phase, fps5, tps, bugs, ...} one per wave (phase 'wave')
+//   error     {kind, msg, at, ...}        each distinct error once a session
+//   error_flood, gpu_lost
+// Only `boot` names the GPU, so perf and errors are tied to it through their
+// session. Games that send none of these get empty results and the dashboard
+// hides the section.
+//
+// Medians are taken in SQL (window functions) rather than by pulling rows into
+// Node: against Turso every row read is billed. "Median" is the lower middle
+// element, so an even count never needs averaging.
+const SLOW_TPS = 27; // physics ticks/s below this = the game runs in slow motion
+const BOOT_BUCKET_MAX = 15; // boot time histogram: 1 s buckets, 15+ in the last
+
+// The GPU label of every session that booted, as a CTE.
+const GPU_LABEL = `TRIM(COALESCE(json_extract(props, '$.gpu.v'), '') || ' ' ||
+                       COALESCE(json_extract(props, '$.gpu.a'), '') || ' ' ||
+                       COALESCE(json_extract(props, '$.gpu.d'), ''))`;
+const bootGpus = (where) => `boots AS (
+    SELECT session_id, MAX(${GPU_LABEL}) AS gpu FROM events
+    WHERE ${where} AND name = 'boot' GROUP BY session_id)`;
+// Wave perf rows with their session's GPU.
+const wavePerf = (where) => `${bootGpus(where)},
+  pe AS (SELECT session_id, props FROM events
+         WHERE ${where} AND name = 'perf' AND json_extract(props, '$.phase') = 'wave'),
+  waves AS (
+    SELECT COALESCE(NULLIF(b.gpu, ''), 'Unknown') AS gpu, pe.session_id,
+           CAST(json_extract(pe.props, '$.fps5') AS REAL) AS fps5,
+           CAST(json_extract(pe.props, '$.tps') AS REAL) AS tps,
+           CAST(json_extract(pe.props, '$.bugs') AS INTEGER) AS bugs
+    FROM pe LEFT JOIN boots b ON b.session_id = pe.session_id)`;
+
+async function perfStats(gameId, since) {
+  const where = `game_id = ? AND created_at >= ? AND ${REAL_EVENT}`;
+  const args = [gameId, since];
+  const count = (name) =>
+    get(`SELECT COUNT(*) AS n FROM events WHERE ${where} AND name = '${name}'`, args);
+  const [
+    boots,
+    bootFails,
+    medBoot,
+    errSessions,
+    floods,
+    gpuLost,
+    byGpu,
+    byBugs,
+    errors,
+    failReasons,
+    failOs,
+    bootTimes,
+  ] = await Promise.all([
+    count("boot"),
+    count("boot_fail"),
+    get(
+      `WITH t AS (
+         SELECT CAST(json_extract(props, '$.ms') AS INTEGER) AS ms,
+                ROW_NUMBER() OVER (ORDER BY CAST(json_extract(props, '$.ms') AS INTEGER)) AS rn,
+                COUNT(*) OVER () AS cnt
+         FROM events WHERE ${where} AND name = 'boot')
+       SELECT ms FROM t WHERE rn = (cnt + 1) / 2`,
+      args
+    ),
+    get(`SELECT COUNT(DISTINCT session_id) AS n FROM events WHERE ${where} AND name = 'error'`, args),
+    count("error_flood"),
+    count("gpu_lost"),
+    all(
+      `WITH ${wavePerf(where)},
+       r AS (
+         SELECT *, ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY fps5) AS rf,
+                   ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY bugs) AS rb,
+                   COUNT(*) OVER (PARTITION BY gpu) AS cnt
+         FROM waves)
+       SELECT gpu, COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS waves,
+              MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
+              MAX(CASE WHEN rb = (cnt + 1) / 2 THEN bugs END) AS bugs_med,
+              SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
+       FROM r GROUP BY gpu ORDER BY sessions DESC, waves DESC LIMIT 15`,
+      [...args, ...args]
+    ),
+    all(
+      `WITH ${wavePerf(where)},
+       r AS (
+         SELECT bugs / 250 AS bucket, fps5, tps,
+                ROW_NUMBER() OVER (PARTITION BY bugs / 250 ORDER BY fps5) AS rf,
+                COUNT(*) OVER (PARTITION BY bugs / 250) AS cnt
+         FROM waves WHERE bugs IS NOT NULL)
+       SELECT bucket, COUNT(*) AS waves,
+              MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
+              SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
+       FROM r GROUP BY bucket ORDER BY bucket`,
+      [...args, ...args]
+    ),
+    all(
+      `WITH ${bootGpus(where)},
+       e AS (
+         SELECT json_extract(props, '$.msg') AS msg, json_extract(props, '$.kind') AS kind,
+                json_extract(props, '$.at') AS at, session_id, created_at
+         FROM events WHERE ${where} AND name = 'error'),
+       g AS (
+         SELECT e.msg, COALESCE(NULLIF(b.gpu, ''), 'Unknown') AS gpu, COUNT(*) AS n,
+                ROW_NUMBER() OVER (PARTITION BY e.msg ORDER BY COUNT(*) DESC) AS rk
+         FROM e LEFT JOIN boots b ON b.session_id = e.session_id GROUP BY e.msg, gpu)
+       SELECT e.msg, MAX(e.kind) AS kind, MAX(e.at) AS at, COUNT(*) AS n,
+              COUNT(DISTINCT e.session_id) AS sessions, MAX(e.created_at) AS last_seen,
+              (SELECT gpu FROM g WHERE g.msg = e.msg AND rk = 1) AS top_gpu
+       FROM e GROUP BY e.msg ORDER BY n DESC, sessions DESC LIMIT 20`,
+      [...args, ...args]
+    ),
+    all(
+      `SELECT COALESCE(json_extract(props, '$.reason'), 'Unknown') AS label, COUNT(*) AS n
+       FROM events WHERE ${where} AND name = 'boot_fail' GROUP BY label ORDER BY n DESC LIMIT 10`,
+      args
+    ),
+    all(
+      `SELECT COALESCE(json_extract(props, '$.os'), 'Unknown') AS label, COUNT(*) AS n
+       FROM events WHERE ${where} AND name = 'boot_fail' GROUP BY label ORDER BY n DESC LIMIT 8`,
+      args
+    ),
+    all(
+      `SELECT MIN(CAST(json_extract(props, '$.ms') AS INTEGER) / 1000, ${BOOT_BUCKET_MAX}) AS bucket,
+              COUNT(*) AS n
+       FROM events WHERE ${where} AND name = 'boot' AND json_extract(props, '$.ms') IS NOT NULL
+       GROUP BY bucket ORDER BY bucket`,
+      args
+    ),
+  ]);
+  return {
+    totals: {
+      boots: boots.n,
+      boot_fails: bootFails.n,
+      median_boot_ms: medBoot?.ms ?? null,
+      error_sessions: errSessions.n,
+      floods: floods.n,
+      gpu_lost: gpuLost.n,
+    },
+    slow_tps: SLOW_TPS,
+    by_gpu: byGpu,
+    by_bugs: byBugs,
+    errors,
+    boot_fail_reasons: failReasons,
+    boot_fail_os: failOs,
+    boot_times: { max_bucket: BOOT_BUCKET_MAX, buckets: bootTimes },
+  };
+}
+
 export async function gameStats(gameId, days = 30) {
   const since = now() - days * 86400;
 
@@ -235,6 +383,7 @@ export async function gameStats(gameId, days = 30) {
     economy,
     playtime,
     recentSessions,
+    perf,
   ] = await Promise.all([
     get(
       `SELECT COUNT(*) AS sessions,
@@ -359,6 +508,7 @@ export async function gameStats(gameId, days = 30) {
        ORDER BY started_at DESC LIMIT 25`,
       [gameId]
     ),
+    perfStats(gameId, since),
   ]);
 
   return {
@@ -374,5 +524,6 @@ export async function gameStats(gameId, days = 30) {
     economy,
     playtime: { bucket_minutes: 10, max_bucket: BUCKET_MAX, buckets: playtime },
     recent_sessions: recentSessions,
+    perf,
   };
 }

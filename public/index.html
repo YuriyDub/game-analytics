@@ -66,6 +66,10 @@
   th[data-sort].desc::after { content: "↓"; opacity: 1; }
   td { padding: 6px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
   td.mut { color: var(--ink-2); }
+  td.bad { color: var(--danger); font-weight: 600; }
+  td.msg { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sec { font-size: 15px; font-weight: 600; margin-top: 8px; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .empty { color: var(--muted); padding: 24px 0; text-align: center; }
   .pager {
     display: flex; align-items: center; gap: 8px; margin-top: 12px;
@@ -154,6 +158,51 @@
       <div id="wavesChart"></div>
     </div>
   </div>
+
+  <!-- Performance & stability. Shown only when the game sends the telemetry
+       convention (boot / boot_fail / perf / error — see perfStats in src/db.js). -->
+  <section id="perfSection" hidden style="display:grid;gap:16px">
+    <h2 class="sec">Performance &amp; stability</h2>
+    <div class="tiles">
+      <div class="card tile"><div class="label">Boots</div><div class="value" id="tBoots">–</div></div>
+      <div class="card tile"><div class="label">Failed boots</div><div class="value" id="tBootFails">–</div></div>
+      <div class="card tile"><div class="label">Median boot time</div><div class="value" id="tBootMs">–</div></div>
+      <div class="card tile"><div class="label">Sessions with errors</div><div class="value" id="tErrSessions">–</div></div>
+    </div>
+    <div class="card">
+      <h2>Performance by GPU · per wave</h2>
+      <div style="overflow-x:auto">
+        <table id="gpuTable">
+          <thead><tr>
+            <th>GPU</th><th>Sessions</th><th>Waves</th><th>p5 FPS (median)</th>
+            <th id="slowHead">Slow waves</th><th>Peak bugs (median)</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="note" id="gpuNote"></div>
+    </div>
+    <div class="grid-2">
+      <div class="card"><h2>p5 FPS (median) by bugs on screen</h2><div id="bugsChart"></div></div>
+      <div class="card"><h2>Boot time</h2><div id="bootChart"></div></div>
+    </div>
+    <div class="card">
+      <h2>Top errors</h2>
+      <div style="overflow-x:auto">
+        <table id="errorsTable">
+          <thead><tr>
+            <th>Error</th><th>Kind</th><th>Count</th><th>Sessions</th><th>Top GPU</th><th>Last seen</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="note" id="errNote"></div>
+    </div>
+    <div class="grid-2" id="bootFailCards" hidden>
+      <div class="card"><h2>Failed boots · reason</h2><div id="failReasonChart"></div></div>
+      <div class="card"><h2>Failed boots · OS</h2><div id="failOsChart"></div></div>
+    </div>
+  </section>
 
   <div class="grid-2">
     <!-- Shown only when the game sends 'build' events with a {type} prop. -->
@@ -461,6 +510,55 @@ $("#waveLevelSel").addEventListener("change", (e) => {
   renderProgression(lastProgression, lastTotalPlayers);
 });
 
+// ---- performance & stability ----
+const pct = (a, b) => b ? Math.round(a / b * 100) : 0;
+function renderPerf(p) {
+  const t = p.totals;
+  const has = t.boots || t.boot_fails || p.by_gpu.length || p.errors.length;
+  $("#perfSection").hidden = !has;
+  if (!has) return;
+  $("#tBoots").textContent = fmtN(t.boots);
+  const tries = t.boots + t.boot_fails;
+  $("#tBootFails").textContent = `${fmtN(t.boot_fails)} · ${pct(t.boot_fails, tries)}%`;
+  $("#tBootMs").textContent = t.median_boot_ms == null ? "–" : (t.median_boot_ms / 1000).toFixed(1) + "s";
+  $("#tErrSessions").textContent = fmtN(t.error_sessions);
+
+  $("#slowHead").textContent = `Slow waves (tps < ${p.slow_tps})`;
+  $("#gpuTable tbody").innerHTML = p.by_gpu.length
+    ? p.by_gpu.map(g => {
+        const slow = pct(g.slow, g.waves);
+        return `<tr><td>${esc(g.gpu)}</td><td>${fmtN(g.sessions)}</td><td>${fmtN(g.waves)}</td>
+          <td>${g.fps5_med ?? "–"}</td><td class="${slow >= 20 ? "bad" : ""}">${g.slow} · ${slow}%</td>
+          <td>${g.bugs_med ?? "–"}</td></tr>`;
+      }).join("")
+    : '<tr><td colspan="6" class="empty">No waves measured yet.</td></tr>';
+  $("#gpuNote").textContent = "p5 FPS: the frame rate the slowest 5% of a wave's frames fall to. " +
+    "A slow wave runs its physics below " + p.slow_tps + " ticks/s — the game itself in slow motion.";
+
+  renderBars($("#bugsChart"), p.by_bugs.map(b => ({
+    label: `${b.bucket * 250}–${b.bucket * 250 + 249} bugs`, n: b.fps5_med ?? 0,
+    sub: `${fmtN(b.waves)} wave${b.waves === 1 ? "" : "s"} · ${pct(b.slow, b.waves)}% slow`,
+  })), null);
+  const max = p.boot_times.max_bucket;
+  renderBars($("#bootChart"), p.boot_times.buckets.map(b => ({
+    label: b.bucket >= max ? `${max}s+` : `${b.bucket}–${b.bucket + 1}s`, n: b.n,
+  })), t.boots);
+
+  $("#errorsTable tbody").innerHTML = p.errors.length
+    ? p.errors.map(e => `<tr>
+        <td class="msg" title="${esc(e.at || "")}">${esc(e.msg ?? "")}</td>
+        <td class="mut">${esc(e.kind ?? "")}</td><td>${fmtN(e.n)}</td><td>${fmtN(e.sessions)}</td>
+        <td class="mut">${esc(e.top_gpu ?? "")}</td>
+        <td class="mut">${new Date(e.last_seen * 1000).toLocaleString()}</td></tr>`).join("")
+    : '<tr><td colspan="6" class="empty">No errors reported. 🎉</td></tr>';
+  $("#errNote").textContent =
+    `Hover an error for its stack. Sessions that hit the 10-error cap: ${fmtN(t.floods)} · GPU device lost: ${fmtN(t.gpu_lost)}.`;
+
+  $("#bootFailCards").hidden = !t.boot_fails;
+  renderBars($("#failReasonChart"), p.boot_fail_reasons, t.boot_fails);
+  renderBars($("#failOsChart"), p.boot_fail_os, t.boot_fails);
+}
+
 // ---- data loading ----
 async function loadStats() {
   if (!gameId) return;
@@ -472,6 +570,7 @@ async function loadStats() {
   renderLine($("#lineChart"), s.daily);
   renderPlaytime($("#playtimeChart"), s.playtime);
   renderProgression(s.progression, s.totals.players);
+  renderPerf(s.perf);
   $("#buildsCard").hidden = !s.builds.length;
   renderBars($("#buildsChart"), s.builds.map(b => ({
     label: b.label, n: b.n,
