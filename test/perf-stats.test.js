@@ -26,14 +26,14 @@ before(async () => {
   await db.recordBatch(GAME, "sA", "pA", REAL, [
     ev("session_start"),
     ev("boot", { ms: 1000, gpu: gpu2060, os: "win" }),
-    ev("perf", { phase: "wave", fps5: 30, tps: 20, bugs: 900, stalls: 6 }),
-    ev("perf", { phase: "wave", fps5: 50, tps: 30, bugs: 300, stalls: 0 }),
+    ev("perf", { phase: "wave", fps5: 30, tps: 20, bugs: 900, stalls: 60, secs: 10 }),
+    ev("perf", { phase: "wave", fps5: 50, tps: 30, bugs: 300, stalls: 0, secs: 10 }),
     ev("perf", { phase: "build", fps5: 5, tps: 30, bugs: 0 }), // not a wave
     ev("error", { kind: "error", msg: "boom", at: "draw (game.js:1:1)" }),
   ]);
   await db.recordBatch(GAME, "sB", "pB", REAL, [
     ev("boot", { ms: 2000, gpu: gpu2060, os: "win" }),
-    ev("perf", { phase: "wave", fps5: 40, tps: 29, bugs: 100, stalls: 3 }),
+    ev("perf", { phase: "wave", fps5: 40, tps: 29, bugs: 100, stalls: 30, secs: 10 }),
     ev("error", { kind: "error", msg: "boom", at: "draw (game.js:1:1)" }),
     ev("error", { kind: "rejection", msg: "other", at: "" }),
     ev("error_flood", { dropped: 3 }),
@@ -76,7 +76,10 @@ test("by GPU: waves joined to the session's boot GPU, medians and slow share", a
   const [nv, mac, old] = [rows[0], rows.find((r) => r.gpu.startsWith("apple")), rows.find((r) => r.gpu === "nvidia turing")];
   assert.equal(nv.gpu, "NVIDIA GeForce RTX 2060"); // the WebGL model wins
   assert.equal(nv.tps_med, 29); // median of 20, 30, 29
-  assert.equal(nv.stalls_avg, 3); // (6 + 0 + 3) / 3
+  // Ticks that waited a frame for the GPU, over all ticks the waves ran:
+  // (60 + 0 + 30) / (20*10 + 30*10 + 29*10) = 90 / 790.
+  assert.equal(nv.stall_share, Math.round((90 / 790) * 1000) / 1000);
+  assert.equal(nv.stalls_avg, undefined); // the raw per-wave count is gone
   assert.equal(old.waves, 1); // no model: vendor + architecture
   assert.equal(nv.sessions, 2);
   assert.equal(nv.waves, 3);

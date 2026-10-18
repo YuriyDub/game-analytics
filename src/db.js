@@ -243,7 +243,8 @@ const wavePerf = (where) => `${bootGpus(where)},
            CAST(json_extract(pe.props, '$.fps5') AS REAL) AS fps5,
            CAST(json_extract(pe.props, '$.tps') AS REAL) AS tps,
            CAST(json_extract(pe.props, '$.bugs') AS INTEGER) AS bugs,
-           CAST(json_extract(pe.props, '$.stalls') AS REAL) AS stalls
+           CAST(json_extract(pe.props, '$.stalls') AS REAL) AS stalls,
+           CAST(json_extract(pe.props, '$.secs') AS REAL) AS secs
     FROM pe LEFT JOIN boots b ON b.session_id = pe.session_id)`;
 
 async function perfStats(gameId, since) {
@@ -291,10 +292,14 @@ async function perfStats(gameId, since) {
               MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
               MAX(CASE WHEN rb = (cnt + 1) / 2 THEN bugs END) AS bugs_med,
               MAX(CASE WHEN rt = (cnt + 1) / 2 THEN tps END) AS tps_med,
-              -- Missed GPU readbacks per wave: high with a low tps = the readback
-              -- is late (driver/sync); ~0 with a low tps = the GPU cannot finish
-              -- the physics step in time.
-              ROUND(AVG(stalls), 1) AS stalls_avg,
+              -- The share of physics ticks that had to wait a frame for the GPU's
+              -- readback: stalls over the ticks the waves ran (tps × secs). A
+              -- raw count per wave meant nothing — it grows with wave length and
+              -- the monitor's refresh rate, and a wait costs no game time as long
+              -- as tps holds. Read it beside tps: high share AND low tps = the GPU
+              -- is not keeping up with the physics.
+              ROUND(SUM(CASE WHEN tps > 0 AND secs > 0 THEN stalls END) * 1.0 /
+                    NULLIF(SUM(CASE WHEN tps > 0 AND secs > 0 THEN tps * secs END), 0), 3) AS stall_share,
               SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
        FROM r GROUP BY gpu ORDER BY sessions DESC, waves DESC LIMIT 15`,
       [...args, ...args]

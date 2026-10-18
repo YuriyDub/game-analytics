@@ -175,7 +175,7 @@
         <table id="gpuTable">
           <thead><tr>
             <th>GPU</th><th>Sessions</th><th>Waves</th><th>p5 FPS (median)</th>
-            <th id="slowHead">Slow waves</th><th>Ticks/s (median)</th><th>Stalls / wave</th>
+            <th id="slowHead">Slow waves</th><th>Ticks/s (median)</th><th>Ticks waiting on GPU</th>
             <th>Peak bugs (median)</th>
           </tr></thead>
           <tbody></tbody>
@@ -531,14 +531,15 @@ function renderPerf(p) {
         return `<tr><td>${esc(g.gpu)}</td><td>${fmtN(g.sessions)}</td><td>${fmtN(g.waves)}</td>
           <td>${g.fps5_med ?? "–"}</td><td class="${slow >= 20 ? "bad" : ""}">${g.slow} · ${slow}%</td>
           <td class="${g.tps_med != null && g.tps_med < p.slow_tps ? "bad" : ""}">${g.tps_med ?? "–"}</td>
-          <td class="mut">${g.stalls_avg ?? "–"}</td>
+          <td class="mut">${g.stall_share == null ? "–" : Math.round(g.stall_share * 100) + "%"}</td>
           <td>${g.bugs_med ?? "–"}</td></tr>`;
       }).join("")
     : '<tr><td colspan="8" class="empty">No waves measured yet.</td></tr>';
   $("#gpuNote").textContent = "p5 FPS: the frame rate the slowest 5% of a wave's frames fall to " +
     "(60 or 120 is just the monitor's refresh). A slow wave runs its physics below " + p.slow_tps +
-    " ticks/s (30 is full speed) — the game itself in slow motion. Low ticks/s with many stalls: " +
-    "the GPU readback comes back late; with ~0 stalls: the GPU cannot finish the physics step in time.";
+    " ticks/s (30 is full speed) — the game itself in slow motion. Ticks waiting on GPU: how often a " +
+    "physics tick had to wait a frame for the GPU's result. Harmless while ticks/s holds at ~30; " +
+    "high together with low ticks/s means the GPU is not keeping up with the physics.";
 
   // The share of waves in slow motion per crowd size — independent of the
   // monitor's refresh rate, which is what made an FPS bar per bucket unreadable.
