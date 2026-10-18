@@ -1,4 +1,14 @@
 import { createClient } from "@libsql/client";
+import {
+  SCHEMA,
+  SESSION_COLUMNS,
+  aggregate,
+  dayOf,
+  isLocalReferrer,
+  newAcc,
+  openSessions,
+  statements,
+} from "./rollup.js";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -59,6 +69,17 @@ await db.batch(
   "write"
 );
 
+// The rollup tables (src/rollup.js) and the two columns sessions gained with
+// them. ALTER TABLE has no IF NOT EXISTS: a column already there is fine.
+await db.batch(SCHEMA, "write");
+for (const sql of SESSION_COLUMNS) {
+  try {
+    await db.execute(sql);
+  } catch (e) {
+    if (!/duplicate column/i.test(String(e && e.message))) throw e;
+  }
+}
+
 const now = () => Math.floor(Date.now() / 1000);
 
 // Local dev playtests are hidden from every read below (the data stays in the
@@ -74,8 +95,29 @@ const IS_LOCAL = `(${[
     ["http", "https"].flatMap((proto) => [`${ref} LIKE '${proto}://${h}:%'`, `${ref} LIKE '${proto}://${h}/%'`])
   ),
 ].join(" OR ")})`;
-const REAL_SESSION = `NOT ${IS_LOCAL}`;
-const REAL_EVENT = `session_id NOT IN (SELECT id FROM sessions WHERE ${IS_LOCAL})`;
+// Sessions carry their local flag since the rollups (2026-10-18), set at write
+// time — the referrer test no longer runs over the whole table on every read.
+const REAL_SESSION = `local = 0`;
+
+// One-off migrations, recorded in `meta` so each runs once per database:
+//   sessions_local   flag the sessions written before the column existed
+//   rollup_from_id   the last event id from before live rollups: history up to
+//                    it is the backfill's (scripts/backfill-rollups.js), every
+//                    later event was rolled up as it arrived
+{
+  const done = new Set((await db.execute("SELECT key FROM meta")).rows.map((r) => r[0]));
+  const stmts = [];
+  if (!done.has("sessions_local"))
+    stmts.push(
+      `UPDATE sessions SET local = 1 WHERE ${IS_LOCAL}`,
+      `INSERT INTO meta (key, value) VALUES ('sessions_local', '1')`
+    );
+  if (!done.has("rollup_from_id"))
+    stmts.push(
+      `INSERT INTO meta (key, value) SELECT 'rollup_from_id', COALESCE(MAX(id), 0) FROM events`
+    );
+  if (stmts.length) await db.batch(stmts, "write");
+}
 
 // id is optional so a game can be re-created with a known id (e.g. after
 // moving databases) — shipped clients keep reporting without a rebuild.
@@ -107,6 +149,9 @@ export async function deleteGame(id) {
   await db.batch(
     [
       { sql: "DELETE FROM events WHERE game_id = ?", args: [id] },
+      ...["daily_counts", "daily_uniques", "level_names", "t_boots", "t_boot_fails", "t_perf", "t_errors"].map(
+        (t) => ({ sql: `DELETE FROM ${t} WHERE game_id = ?`, args: [id] })
+      ),
       { sql: "DELETE FROM sessions WHERE game_id = ?", args: [id] },
       { sql: "DELETE FROM games WHERE id = ?", args: [id] },
     ],
@@ -116,11 +161,15 @@ export async function deleteGame(id) {
 
 export async function recordBatch(gameId, sessionId, playerId, meta, events) {
   const t = now();
+  const local = isLocalReferrer(meta.referrer) ? 1 : 0;
+  const kept = events.filter((e) => e.name !== "heartbeat"); // heartbeats only refresh last_seen
+  const counted = kept.filter((e) => e.name !== "session_start").length;
   const stmts = [
     {
-      sql: `INSERT INTO sessions (id, game_id, player_id, started_at, last_seen, referrer, browser, os, screen, lang)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen
+      sql: `INSERT INTO sessions (id, game_id, player_id, started_at, last_seen, referrer, browser, os, screen, lang, local, events)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen,
+                                          events = sessions.events + excluded.events
             WHERE sessions.game_id = excluded.game_id`,
       args: [
         sessionId,
@@ -133,16 +182,37 @@ export async function recordBatch(gameId, sessionId, playerId, meta, events) {
         meta.os || null,
         meta.screen || null,
         meta.lang || null,
+        local,
+        counted,
       ],
     },
   ];
-  for (const ev of events) {
-    if (ev.name === "heartbeat") continue; // heartbeats only refresh last_seen
+  for (const ev of kept) {
     stmts.push({
       sql: `INSERT INTO events (game_id, session_id, player_id, name, props, created_at)
             VALUES (?, ?, ?, ?, ?, ?)`,
       args: [gameId, sessionId, playerId, ev.name, ev.props ? JSON.stringify(ev.props) : null, t],
     });
+  }
+  // The dashboard's numbers, folded in as the events land (src/rollup.js).
+  // A local dev session is never counted.
+  if (!local && kept.length) {
+    const acc = newAcc();
+    const gpus = new Map();
+    aggregate(
+      acc,
+      kept.map((e) => ({ game: gameId, session: sessionId, player: playerId, name: e.name, props: e.props, t })),
+      gpus
+    );
+    // Perf or errors from a session whose boot came in an earlier batch.
+    for (const sid of openSessions(acc, gpus)) {
+      const row = await get(
+        "SELECT gpu FROM t_boots WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        [sid]
+      );
+      if (row) gpus.set(sid, row.gpu);
+    }
+    stmts.push(...statements(acc, gpus));
   }
   await db.batch(stmts, "write");
 }
@@ -180,26 +250,21 @@ export async function playerRows(gameId, days = 30, opts = {}) {
        WHERE game_id = ? AND started_at >= ? AND ${REAL_SESSION}`,
       [gameId, since]
     ),
-    // The events join is grouped by player, so it stays 1:1 with each player
-    // group and can't inflate the session COUNT(*).
+    // Events per player from the sessions' own counters (sessions.events),
+    // rather than a scan of the events table.
     all(
       `SELECT s.player_id,
               COUNT(*) AS sessions,
               SUM(s.last_seen - s.started_at) AS playtime_s,
               MIN(s.started_at) AS first_seen,
               MAX(s.last_seen) AS last_seen,
-              COALESCE(e.n, 0) AS events
+              SUM(s.events) AS events
        FROM sessions s
-       LEFT JOIN (
-         SELECT player_id, COUNT(*) AS n FROM events
-         WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')
-         GROUP BY player_id
-       ) e ON e.player_id = s.player_id
        WHERE s.game_id = ? AND s.started_at >= ? AND ${REAL_SESSION}
        GROUP BY s.player_id
        ORDER BY ${col} ${dir}, s.player_id ASC
        LIMIT ? OFFSET ?`,
-      [gameId, since, gameId, since, limit, offset]
+      [gameId, since, limit, offset]
     ),
   ]);
 
@@ -223,35 +288,18 @@ export async function playerRows(gameId, days = 30, opts = {}) {
 const SLOW_TPS = 27; // physics ticks/s below this = the game runs in slow motion
 const BOOT_BUCKET_MAX = 15; // boot time histogram: 1 s buckets, 15+ in the last
 
-// The GPU label of every session that booted, as a CTE: the card's model when
-// the client sent one (gpu.r, from WebGL — "NVIDIA GeForce RTX 2060"), else
-// WebGPU's vendor + architecture + description ("nvidia turing"), which is all
-// Chrome's adapter info gives and older clients sent.
-const GPU_LABEL = `COALESCE(NULLIF(TRIM(json_extract(props, '$.gpu.r')), ''),
-                    TRIM(COALESCE(json_extract(props, '$.gpu.v'), '') || ' ' ||
-                         COALESCE(json_extract(props, '$.gpu.a'), '') || ' ' ||
-                         COALESCE(json_extract(props, '$.gpu.d'), '')))`;
-const bootGpus = (where) => `boots AS (
-    SELECT session_id, MAX(${GPU_LABEL}) AS gpu FROM events
-    WHERE ${where} AND name = 'boot' GROUP BY session_id)`;
-// Wave perf rows with their session's GPU.
-const wavePerf = (where) => `${bootGpus(where)},
-  pe AS (SELECT session_id, props FROM events
-         WHERE ${where} AND name = 'perf' AND json_extract(props, '$.phase') = 'wave'),
-  waves AS (
-    SELECT COALESCE(NULLIF(b.gpu, ''), 'Unknown') AS gpu, pe.session_id,
-           CAST(json_extract(pe.props, '$.fps5') AS REAL) AS fps5,
-           CAST(json_extract(pe.props, '$.tps') AS REAL) AS tps,
-           CAST(json_extract(pe.props, '$.bugs') AS INTEGER) AS bugs,
-           CAST(json_extract(pe.props, '$.stalls') AS REAL) AS stalls,
-           CAST(json_extract(pe.props, '$.secs') AS REAL) AS secs
-    FROM pe LEFT JOIN boots b ON b.session_id = pe.session_id)`;
-
+// Every telemetry read goes to the rollup tables (src/rollup.js): t_boots,
+// t_boot_fails, t_perf, t_errors — one compact row per event, the GPU already
+// resolved — and daily_counts for the error_flood / gpu_lost tallies.
 async function perfStats(gameId, since) {
-  const where = `game_id = ? AND created_at >= ? AND ${REAL_EVENT}`;
   const args = [gameId, since];
-  const count = (name) =>
-    get(`SELECT COUNT(*) AS n FROM events WHERE ${where} AND name = '${name}'`, args);
+  const tw = "game_id = ? AND created_at >= ?";
+  const tally = (key) =>
+    get(
+      `SELECT COALESCE(SUM(n), 0) AS n FROM daily_counts
+       WHERE game_id = ? AND metric = 'event' AND key = '${key}' AND day >= ?`,
+      [gameId, dayOf(since)]
+    );
   const [
     boots,
     bootFails,
@@ -266,88 +314,74 @@ async function perfStats(gameId, since) {
     failOs,
     bootTimes,
   ] = await Promise.all([
-    count("boot"),
-    count("boot_fail"),
+    get(`SELECT COUNT(*) AS n FROM t_boots WHERE ${tw}`, args),
+    get(`SELECT COUNT(*) AS n FROM t_boot_fails WHERE ${tw}`, args),
     get(
       `WITH t AS (
-         SELECT CAST(json_extract(props, '$.ms') AS INTEGER) AS ms,
-                ROW_NUMBER() OVER (ORDER BY CAST(json_extract(props, '$.ms') AS INTEGER)) AS rn,
-                COUNT(*) OVER () AS cnt
-         FROM events WHERE ${where} AND name = 'boot')
+         SELECT ms, ROW_NUMBER() OVER (ORDER BY ms) AS rn, COUNT(*) OVER () AS cnt
+         FROM t_boots WHERE ${tw})
        SELECT ms FROM t WHERE rn = (cnt + 1) / 2`,
       args
     ),
-    get(`SELECT COUNT(DISTINCT session_id) AS n FROM events WHERE ${where} AND name = 'error'`, args),
-    count("error_flood"),
-    count("gpu_lost"),
+    get(`SELECT COUNT(DISTINCT session_id) AS n FROM t_errors WHERE ${tw}`, args),
+    tally("error_flood"),
+    tally("gpu_lost"),
     all(
-      `WITH ${wavePerf(where)},
-       r AS (
+      `WITH r AS (
          SELECT *, ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY fps5) AS rf,
                    ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY bugs) AS rb,
                    ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY tps) AS rt,
                    COUNT(*) OVER (PARTITION BY gpu) AS cnt
-         FROM waves)
+         FROM t_perf WHERE ${tw})
        SELECT gpu, COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS waves,
               MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
               MAX(CASE WHEN rb = (cnt + 1) / 2 THEN bugs END) AS bugs_med,
               MAX(CASE WHEN rt = (cnt + 1) / 2 THEN tps END) AS tps_med,
               -- The share of physics ticks that had to wait a frame for the GPU's
-              -- readback: stalls over the ticks the waves ran (tps × secs). A
-              -- raw count per wave meant nothing — it grows with wave length and
-              -- the monitor's refresh rate, and a wait costs no game time as long
-              -- as tps holds. Read it beside tps: high share AND low tps = the GPU
-              -- is not keeping up with the physics.
+              -- readback: stalls over the ticks the waves ran (tps × secs). Read
+              -- it beside tps: high share AND low tps = the GPU is not keeping up.
               ROUND(SUM(CASE WHEN tps > 0 AND secs > 0 THEN stalls END) * 1.0 /
                     NULLIF(SUM(CASE WHEN tps > 0 AND secs > 0 THEN tps * secs END), 0), 3) AS stall_share,
               SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
        FROM r GROUP BY gpu ORDER BY sessions DESC, waves DESC LIMIT 15`,
-      [...args, ...args]
+      args
     ),
     all(
-      `WITH ${wavePerf(where)},
-       r AS (
+      `WITH r AS (
          SELECT bugs / 250 AS bucket, fps5, tps,
                 ROW_NUMBER() OVER (PARTITION BY bugs / 250 ORDER BY fps5) AS rf,
                 COUNT(*) OVER (PARTITION BY bugs / 250) AS cnt
-         FROM waves WHERE bugs IS NOT NULL)
+         FROM t_perf WHERE ${tw} AND bugs IS NOT NULL)
        SELECT bucket, COUNT(*) AS waves,
               MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
               SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
        FROM r GROUP BY bucket ORDER BY bucket`,
-      [...args, ...args]
+      args
     ),
     all(
-      `WITH ${bootGpus(where)},
-       e AS (
-         SELECT json_extract(props, '$.msg') AS msg, json_extract(props, '$.kind') AS kind,
-                json_extract(props, '$.at') AS at, session_id, created_at
-         FROM events WHERE ${where} AND name = 'error'),
+      `WITH e AS (SELECT * FROM t_errors WHERE ${tw}),
        g AS (
-         SELECT e.msg, COALESCE(NULLIF(b.gpu, ''), 'Unknown') AS gpu, COUNT(*) AS n,
-                ROW_NUMBER() OVER (PARTITION BY e.msg ORDER BY COUNT(*) DESC) AS rk
-         FROM e LEFT JOIN boots b ON b.session_id = e.session_id GROUP BY e.msg, gpu)
+         SELECT msg, gpu, ROW_NUMBER() OVER (PARTITION BY msg ORDER BY COUNT(*) DESC) AS rk
+         FROM e GROUP BY msg, gpu)
        SELECT e.msg, MAX(e.kind) AS kind, MAX(e.at) AS at, COUNT(*) AS n,
               COUNT(DISTINCT e.session_id) AS sessions, MAX(e.created_at) AS last_seen,
-              (SELECT gpu FROM g WHERE g.msg = e.msg AND rk = 1) AS top_gpu
+              (SELECT gpu FROM g WHERE g.msg IS e.msg AND rk = 1) AS top_gpu
        FROM e GROUP BY e.msg ORDER BY n DESC, sessions DESC LIMIT 20`,
-      [...args, ...args]
-    ),
-    all(
-      `SELECT COALESCE(json_extract(props, '$.reason'), 'Unknown') AS label, COUNT(*) AS n
-       FROM events WHERE ${where} AND name = 'boot_fail' GROUP BY label ORDER BY n DESC LIMIT 10`,
       args
     ),
     all(
-      `SELECT COALESCE(json_extract(props, '$.os'), 'Unknown') AS label, COUNT(*) AS n
-       FROM events WHERE ${where} AND name = 'boot_fail' GROUP BY label ORDER BY n DESC LIMIT 8`,
+      `SELECT COALESCE(reason, 'Unknown') AS label, COUNT(*) AS n
+       FROM t_boot_fails WHERE ${tw} GROUP BY label ORDER BY n DESC LIMIT 10`,
       args
     ),
     all(
-      `SELECT MIN(CAST(json_extract(props, '$.ms') AS INTEGER) / 1000, ${BOOT_BUCKET_MAX}) AS bucket,
-              COUNT(*) AS n
-       FROM events WHERE ${where} AND name = 'boot' AND json_extract(props, '$.ms') IS NOT NULL
-       GROUP BY bucket ORDER BY bucket`,
+      `SELECT COALESCE(os, 'Unknown') AS label, COUNT(*) AS n
+       FROM t_boot_fails WHERE ${tw} GROUP BY label ORDER BY n DESC LIMIT 8`,
+      args
+    ),
+    all(
+      `SELECT MIN(ms / 1000, ${BOOT_BUCKET_MAX}) AS bucket, COUNT(*) AS n
+       FROM t_boots WHERE ${tw} AND ms IS NOT NULL GROUP BY bucket ORDER BY bucket`,
       args
     ),
   ]);
@@ -372,6 +406,20 @@ async function perfStats(gameId, since) {
 
 export async function gameStats(gameId, days = 30) {
   const since = now() - days * 86400;
+  // The rollups are by day: a period covers whole days back to the first one.
+  const sinceDay = dayOf(since);
+  // Count and distinct players per key of a metric (builds, upgrades).
+  const popularity = (metric, limit) =>
+    all(
+      `WITH c AS (SELECT key, SUM(n) AS n FROM daily_counts
+                  WHERE game_id = ? AND metric = ? AND day >= ? GROUP BY key),
+            u AS (SELECT key, COUNT(DISTINCT player_id) AS players FROM daily_uniques
+                  WHERE game_id = ? AND metric = ? AND day >= ? GROUP BY key)
+       SELECT c.key AS label, c.n AS n, COALESCE(u.players, 0) AS players
+       FROM c LEFT JOIN u ON u.key = c.key
+       ORDER BY n DESC LIMIT ${limit}`,
+      [gameId, metric, sinceDay, gameId, metric, sinceDay]
+    );
 
   const breakdown = (col) =>
     all(
@@ -409,9 +457,9 @@ export async function gameStats(gameId, days = 30) {
       [gameId, since]
     ),
     get(
-      `SELECT COUNT(*) AS n FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')`,
-      [gameId, since]
+      `SELECT COALESCE(SUM(n), 0) AS n FROM daily_counts
+       WHERE game_id = ? AND metric = 'event' AND day >= ?`,
+      [gameId, sinceDay]
     ),
     // Median playtime over engaged sessions only: bounces (< 1 min) are
     // excluded so the tile reflects players who actually played, and sessions
@@ -442,10 +490,10 @@ export async function gameStats(gameId, days = 30) {
     breakdown("os"),
     breakdown("referrer"),
     all(
-      `SELECT name AS label, COUNT(*) AS n FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name NOT IN ('session_start')
-       GROUP BY name ORDER BY n DESC LIMIT 10`,
-      [gameId, since]
+      `SELECT key AS label, SUM(n) AS n FROM daily_counts
+       WHERE game_id = ? AND metric = 'event' AND day >= ?
+       GROUP BY key ORDER BY n DESC LIMIT 10`,
+      [gameId, sinceDay]
     ),
     // Progression funnel: unique players who started each level/wave, read from
     // the JSON props of level_start / wave_start events (a convention, not a
@@ -453,58 +501,41 @@ export async function gameStats(gameId, days = 30) {
     // dashboard hides the section). Events without a numeric level are skipped
     // (e.g. editor playtests send level: null).
     all(
-      `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
-              MAX(json_extract(props, '$.name')) AS name,
-              COUNT(DISTINCT player_id) AS players
-       FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'level_start'
-         AND json_extract(props, '$.level') IS NOT NULL
+      `SELECT CAST(u.key AS INTEGER) AS level, MAX(l.name) AS name,
+              COUNT(DISTINCT u.player_id) AS players
+       FROM daily_uniques u
+       LEFT JOIN level_names l ON l.game_id = u.game_id AND l.level = CAST(u.key AS INTEGER)
+       WHERE u.game_id = ? AND u.metric = 'level' AND u.day >= ?
        GROUP BY level ORDER BY level`,
-      [gameId, since]
+      [gameId, sinceDay]
     ),
     all(
-      `SELECT CAST(json_extract(props, '$.level') AS INTEGER) AS level,
-              CAST(json_extract(props, '$.wave') AS INTEGER) AS wave,
+      `SELECT CAST(substr(key, 1, instr(key, ':') - 1) AS INTEGER) AS level,
+              CAST(substr(key, instr(key, ':') + 1) AS INTEGER) AS wave,
               COUNT(DISTINCT player_id) AS players
-       FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'wave_start'
-         AND json_extract(props, '$.level') IS NOT NULL
-         AND json_extract(props, '$.wave') IS NOT NULL
+       FROM daily_uniques
+       WHERE game_id = ? AND metric = 'wave' AND day >= ?
        GROUP BY level, wave ORDER BY level, wave`,
-      [gameId, since]
+      [gameId, sinceDay]
     ),
     // Build popularity: placements per turret/obstacle type, from the JSON
     // props of 'build' events (same opt-in convention as the funnel).
-    all(
-      `SELECT COALESCE(json_extract(props, '$.type'), 'unknown') AS label,
-              COUNT(*) AS n,
-              COUNT(DISTINCT player_id) AS players
-       FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'build'
-       GROUP BY label ORDER BY n DESC LIMIT 12`,
-      [gameId, since]
-    ),
+    popularity("build", 12),
     // Upgrade popularity: purchases per tech node, from 'upgrade' events.
-    all(
-      `SELECT COALESCE(json_extract(props, '$.id'), 'unknown') AS label,
-              COUNT(*) AS n,
-              COUNT(DISTINCT player_id) AS players
-       FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'upgrade'
-       GROUP BY label ORDER BY n DESC LIMIT 15`,
-      [gameId, since]
-    ),
+    popularity("upgrade", 15),
     // Economy curve: average currency held at fixed playtime marks, from
     // 'currency_milestone' events ({min, crystals, ...}).
     all(
-      `SELECT CAST(json_extract(props, '$.min') AS INTEGER) AS min,
-              ROUND(AVG(json_extract(props, '$.crystals'))) AS avg_crystals,
-              COUNT(DISTINCT player_id) AS players
-       FROM events
-       WHERE game_id = ? AND created_at >= ? AND ${REAL_EVENT} AND name = 'currency_milestone'
-         AND json_extract(props, '$.min') IS NOT NULL
-       GROUP BY min ORDER BY min`,
-      [gameId, since]
+      `WITH c AS (SELECT key, SUM(n) AS n, SUM(sum) AS s FROM daily_counts
+                  WHERE game_id = ? AND metric = 'econ' AND day >= ? GROUP BY key),
+            u AS (SELECT key, COUNT(DISTINCT player_id) AS players FROM daily_uniques
+                  WHERE game_id = ? AND metric = 'econ' AND day >= ? GROUP BY key)
+       SELECT CAST(u.key AS INTEGER) AS min,
+              CASE WHEN c.n > 0 THEN ROUND(c.s / c.n) END AS avg_crystals,
+              u.players AS players
+       FROM u LEFT JOIN c ON c.key = u.key
+       ORDER BY min`,
+      [gameId, sinceDay, gameId, sinceDay]
     ),
     // Playtime histogram: players bucketed by their TOTAL time played across
     // all sessions in the period, in 10-minute buckets. Everything past
