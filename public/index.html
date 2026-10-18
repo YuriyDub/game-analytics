@@ -568,9 +568,14 @@ function renderPerf(p) {
 }
 
 // ---- data loading ----
+let lastStats = null;
 async function loadStats() {
   if (!gameId) return;
-  const s = await api(`/api/games/${gameId}/stats?days=${days}`);
+  lastStats = await api(`/api/games/${gameId}/stats?days=${days}`);
+  renderStats(lastStats);
+}
+// Drawing only, from data already fetched — what a window resize re-runs.
+function renderStats(s) {
   $("#tPlayers").textContent = fmtN(s.totals.players);
   $("#tSessions").textContent = fmtN(s.totals.sessions);
   $("#tPlaytime").textContent = fmtDur(s.totals.median_playtime_s);
@@ -732,7 +737,14 @@ $("#deleteGame").addEventListener("click", async () => {
   gameId = null;
   await loadGames();
 });
-addEventListener("resize", () => loadStats());
+// A resize redraws the charts from the stats already on the page. It used to
+// refetch them — every resize event, dozens per drag, each a full set of
+// queries against the billed database.
+let _resizeT = 0;
+addEventListener("resize", () => {
+  clearTimeout(_resizeT);
+  _resizeT = setTimeout(() => lastStats && renderStats(lastStats), 150);
+});
 
 loadGames();
 </script>

@@ -1,6 +1,7 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { memo } from "./src/cache.js";
 import {
   createGame,
   deleteGame,
@@ -145,10 +146,15 @@ app.delete("/api/games/:id", ah(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// The dashboard's reads, cached for 10 minutes (src/cache.js): Turso bills every
+// row a query reads, and a stats load reads the whole event table many times.
+const cachedStats = memo(gameStats);
+const cachedPlayers = memo(playerRows);
+
 app.get("/api/games/:id/stats", ah(async (req, res) => {
   if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
   const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
-  res.json(await gameStats(req.params.id, days));
+  res.json(await cachedStats(req.params.id, days));
 }));
 
 // Paged + sorted player list. Unknown sort keys fall back to a default in the
@@ -156,7 +162,7 @@ app.get("/api/games/:id/stats", ah(async (req, res) => {
 app.get("/api/games/:id/players", ah(async (req, res) => {
   if (!(await getGame(req.params.id))) return res.status(404).json({ error: "unknown game" });
   const days = Math.min(365, Math.max(1, Number(req.query.days) || 30));
-  res.json(await playerRows(req.params.id, days, {
+  res.json(await cachedPlayers(req.params.id, days, {
     sort: req.query.sort,
     dir: req.query.dir,
     limit: Number(req.query.limit) || 25,
