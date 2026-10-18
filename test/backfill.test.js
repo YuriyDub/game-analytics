@@ -65,3 +65,22 @@ test("events after the boundary are left to live rollups", async () => {
   assert.equal(r.events, 0);
   assert.equal((await d.gameStats(GAME, 30)).totals.events, before + 1);
 });
+
+test("live perf from a session that booted before the boundary gets its GPU", async () => {
+  // A boot in history…
+  await d.recordBatch(GAME, "s9", "p9", { referrer: "https://itch.io" }, [
+    { name: "boot", props: { ms: 1500, gpu: { v: "amd", a: "gcn-5", d: "", r: "AMD Radeon Vega 8" } } },
+  ]);
+  await forget(); // history now ends after that boot
+  // …and the perf after it, live: no boot to find yet.
+  await d.recordBatch(GAME, "s9", "p9", { referrer: "https://itch.io" }, [
+    { name: "perf", props: { phase: "wave", fps5: 30, tps: 22, bugs: 4000, stalls: 1, secs: 10 } },
+    { name: "error", props: { kind: "error", msg: "late", at: "" } },
+  ]);
+  const gpuOf = async (t) =>
+    (await d.db.execute({ sql: `SELECT gpu FROM ${t} WHERE session_id = 's9'`, args: [] })).rows[0][0];
+  assert.equal(await gpuOf("t_perf"), "Unknown");
+  await backfill(d.db, { pageSize: 50 });
+  assert.equal(await gpuOf("t_perf"), "AMD Radeon Vega 8");
+  assert.equal(await gpuOf("t_errors"), "AMD Radeon Vega 8");
+});

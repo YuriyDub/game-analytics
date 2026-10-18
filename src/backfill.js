@@ -67,6 +67,19 @@ export async function backfill(db, { pageSize = 5000, log = () => {} } = {}) {
     events += rows.length;
     log(`page ${pages}: events up to id ${done} of ${until}`);
   }
+  // Perf and error rows written live from a session that booted before the
+  // boundary found no boot in t_boots then and were filed under 'Unknown'. Now
+  // that history's boots are in, give them their GPU. (t_perf / t_errors are
+  // small — one row per wave / per distinct error — so this is cheap.)
+  await db.batch(
+    ["t_perf", "t_errors"].map(
+      (t) => `UPDATE ${t} SET gpu = (SELECT b.gpu FROM t_boots b WHERE b.session_id = ${t}.session_id
+                                     ORDER BY b.id DESC LIMIT 1)
+              WHERE gpu = 'Unknown'
+                AND EXISTS (SELECT 1 FROM t_boots b WHERE b.session_id = ${t}.session_id)`
+    ),
+    "write"
+  );
   return { pages, events, until };
 }
 
