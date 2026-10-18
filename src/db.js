@@ -223,10 +223,14 @@ export async function playerRows(gameId, days = 30, opts = {}) {
 const SLOW_TPS = 27; // physics ticks/s below this = the game runs in slow motion
 const BOOT_BUCKET_MAX = 15; // boot time histogram: 1 s buckets, 15+ in the last
 
-// The GPU label of every session that booted, as a CTE.
-const GPU_LABEL = `TRIM(COALESCE(json_extract(props, '$.gpu.v'), '') || ' ' ||
-                       COALESCE(json_extract(props, '$.gpu.a'), '') || ' ' ||
-                       COALESCE(json_extract(props, '$.gpu.d'), ''))`;
+// The GPU label of every session that booted, as a CTE: the card's model when
+// the client sent one (gpu.r, from WebGL — "NVIDIA GeForce RTX 2060"), else
+// WebGPU's vendor + architecture + description ("nvidia turing"), which is all
+// Chrome's adapter info gives and older clients sent.
+const GPU_LABEL = `COALESCE(NULLIF(TRIM(json_extract(props, '$.gpu.r')), ''),
+                    TRIM(COALESCE(json_extract(props, '$.gpu.v'), '') || ' ' ||
+                         COALESCE(json_extract(props, '$.gpu.a'), '') || ' ' ||
+                         COALESCE(json_extract(props, '$.gpu.d'), '')))`;
 const bootGpus = (where) => `boots AS (
     SELECT session_id, MAX(${GPU_LABEL}) AS gpu FROM events
     WHERE ${where} AND name = 'boot' GROUP BY session_id)`;
@@ -238,7 +242,8 @@ const wavePerf = (where) => `${bootGpus(where)},
     SELECT COALESCE(NULLIF(b.gpu, ''), 'Unknown') AS gpu, pe.session_id,
            CAST(json_extract(pe.props, '$.fps5') AS REAL) AS fps5,
            CAST(json_extract(pe.props, '$.tps') AS REAL) AS tps,
-           CAST(json_extract(pe.props, '$.bugs') AS INTEGER) AS bugs
+           CAST(json_extract(pe.props, '$.bugs') AS INTEGER) AS bugs,
+           CAST(json_extract(pe.props, '$.stalls') AS REAL) AS stalls
     FROM pe LEFT JOIN boots b ON b.session_id = pe.session_id)`;
 
 async function perfStats(gameId, since) {
@@ -279,11 +284,17 @@ async function perfStats(gameId, since) {
        r AS (
          SELECT *, ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY fps5) AS rf,
                    ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY bugs) AS rb,
+                   ROW_NUMBER() OVER (PARTITION BY gpu ORDER BY tps) AS rt,
                    COUNT(*) OVER (PARTITION BY gpu) AS cnt
          FROM waves)
        SELECT gpu, COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS waves,
               MAX(CASE WHEN rf = (cnt + 1) / 2 THEN fps5 END) AS fps5_med,
               MAX(CASE WHEN rb = (cnt + 1) / 2 THEN bugs END) AS bugs_med,
+              MAX(CASE WHEN rt = (cnt + 1) / 2 THEN tps END) AS tps_med,
+              -- Missed GPU readbacks per wave: high with a low tps = the readback
+              -- is late (driver/sync); ~0 with a low tps = the GPU cannot finish
+              -- the physics step in time.
+              ROUND(AVG(stalls), 1) AS stalls_avg,
               SUM(CASE WHEN tps IS NOT NULL AND tps < ${SLOW_TPS} THEN 1 ELSE 0 END) AS slow
        FROM r GROUP BY gpu ORDER BY sessions DESC, waves DESC LIMIT 15`,
       [...args, ...args]

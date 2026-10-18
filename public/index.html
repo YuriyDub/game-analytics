@@ -175,7 +175,8 @@
         <table id="gpuTable">
           <thead><tr>
             <th>GPU</th><th>Sessions</th><th>Waves</th><th>p5 FPS (median)</th>
-            <th id="slowHead">Slow waves</th><th>Peak bugs (median)</th>
+            <th id="slowHead">Slow waves</th><th>Ticks/s (median)</th><th>Stalls / wave</th>
+            <th>Peak bugs (median)</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -183,7 +184,7 @@
       <div class="note" id="gpuNote"></div>
     </div>
     <div class="grid-2">
-      <div class="card"><h2>p5 FPS (median) by bugs on screen</h2><div id="bugsChart"></div></div>
+      <div class="card"><h2>Slow waves (%) by bugs on screen</h2><div id="bugsChart"></div></div>
       <div class="card"><h2>Boot time</h2><div id="bootChart"></div></div>
     </div>
     <div class="card">
@@ -391,7 +392,7 @@ function renderBars(el, items, total) {
   el.innerHTML = "";
   if (!items.length) { el.innerHTML = '<div class="empty">No data yet.</div>'; return; }
   const W = el.clientWidth || 420, ROW = 30, BAR = 18, H = items.length * ROW;
-  const maxV = Math.max(...items.map(i => i.n));
+  const maxV = Math.max(...items.map(i => i.n)) || 1; // all zero: flat 2px bars, not NaN
   const labelW = 120, valW = 56, iw = W - labelW - valW;
   let body = "";
   items.forEach((it, i) => {
@@ -529,15 +530,21 @@ function renderPerf(p) {
         const slow = pct(g.slow, g.waves);
         return `<tr><td>${esc(g.gpu)}</td><td>${fmtN(g.sessions)}</td><td>${fmtN(g.waves)}</td>
           <td>${g.fps5_med ?? "–"}</td><td class="${slow >= 20 ? "bad" : ""}">${g.slow} · ${slow}%</td>
+          <td class="${g.tps_med != null && g.tps_med < p.slow_tps ? "bad" : ""}">${g.tps_med ?? "–"}</td>
+          <td class="mut">${g.stalls_avg ?? "–"}</td>
           <td>${g.bugs_med ?? "–"}</td></tr>`;
       }).join("")
-    : '<tr><td colspan="6" class="empty">No waves measured yet.</td></tr>';
-  $("#gpuNote").textContent = "p5 FPS: the frame rate the slowest 5% of a wave's frames fall to. " +
-    "A slow wave runs its physics below " + p.slow_tps + " ticks/s — the game itself in slow motion.";
+    : '<tr><td colspan="8" class="empty">No waves measured yet.</td></tr>';
+  $("#gpuNote").textContent = "p5 FPS: the frame rate the slowest 5% of a wave's frames fall to " +
+    "(60 or 120 is just the monitor's refresh). A slow wave runs its physics below " + p.slow_tps +
+    " ticks/s (30 is full speed) — the game itself in slow motion. Low ticks/s with many stalls: " +
+    "the GPU readback comes back late; with ~0 stalls: the GPU cannot finish the physics step in time.";
 
+  // The share of waves in slow motion per crowd size — independent of the
+  // monitor's refresh rate, which is what made an FPS bar per bucket unreadable.
   renderBars($("#bugsChart"), p.by_bugs.map(b => ({
-    label: `${b.bucket * 250}–${b.bucket * 250 + 249} bugs`, n: b.fps5_med ?? 0,
-    sub: `${fmtN(b.waves)} wave${b.waves === 1 ? "" : "s"} · ${pct(b.slow, b.waves)}% slow`,
+    label: `${b.bucket * 250}–${b.bucket * 250 + 249} bugs`, n: pct(b.slow, b.waves),
+    sub: `${fmtN(b.waves)} wave${b.waves === 1 ? "" : "s"} · p5 FPS ${b.fps5_med ?? "–"}`,
   })), null);
   const max = p.boot_times.max_bucket;
   renderBars($("#bootChart"), p.boot_times.buckets.map(b => ({
